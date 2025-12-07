@@ -2,17 +2,25 @@
 #include <cmath>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 
 RegularStepGradientDescentOptimizer::RegularStepGradientDescentOptimizer()
-    : m_MaximumStepLength(1.0)
-    , m_MinimumStepLength(0.001)
-    , m_NumberOfIterations(100)
+    : m_LearningRate(1.0)
+    , m_MinimumStepLength(0.0001)
+    , m_NumberOfIterations(300)
     , m_RelaxationFactor(0.5)
     , m_GradientMagnitudeTolerance(1e-4)
+    , m_ReturnBestParameters(true)
+    , m_NumberOfParameters(6)
     , m_CurrentValue(0.0)
+    , m_BestValue(std::numeric_limits<double>::max())
     , m_CurrentIteration(0)
     , m_CurrentStepLength(1.0)
+    , m_PreviousValue(std::numeric_limits<double>::max())
+    , m_StopCondition(MAXIMUM_ITERATIONS)
 {
+    // 默认尺度 - 全为1
+    m_Scales.resize(6, 1.0);
 }
 
 RegularStepGradientDescentOptimizer::~RegularStepGradientDescentOptimizer()
@@ -25,110 +33,133 @@ void RegularStepGradientDescentOptimizer::StartOptimization()
     {
         throw std::runtime_error("Cost function or gradient function not set");
     }
-
-    if (m_InitialPosition.empty())
+    
+    if (!m_GetParameters || !m_SetParameters)
     {
-        throw std::runtime_error("Initial position not set");
+        throw std::runtime_error("Get/Set parameters functions not set");
     }
 
     // 初始化
-    m_CurrentPosition = m_InitialPosition;
-    m_CurrentStepLength = m_MaximumStepLength;
+    m_CurrentStepLength = m_LearningRate;
     m_CurrentIteration = 0;
+    m_BestValue = std::numeric_limits<double>::max();
+    m_PreviousValue = std::numeric_limits<double>::max();
+    m_CurrentGradient.resize(m_NumberOfParameters, 0.0);
+    
+    // 确保尺度正确
+    if (m_Scales.size() != m_NumberOfParameters)
+    {
+        m_Scales.resize(m_NumberOfParameters, 1.0);
+    }
 
-    std::cout << "\n=== Starting Optimization ===" << std::endl;
-    std::cout << "Maximum iterations: " << m_NumberOfIterations << std::endl;
-    std::cout << "Initial step length: " << m_MaximumStepLength << std::endl;
-    std::cout << "Minimum step length: " << m_MinimumStepLength << std::endl;
-    std::cout << "Relaxation factor: " << m_RelaxationFactor << std::endl;
-    std::cout << "Number of parameters: " << m_CurrentPosition.size() << std::endl;
+    // 获取初始参数
+    m_PreviousParameters = m_GetParameters();
+    m_BestParameters = m_PreviousParameters;
+    
+    // 计算初始值
+    m_CurrentValue = m_CostFunction();
+    m_BestValue = m_CurrentValue;
 
     // 开始迭代
     for (m_CurrentIteration = 0; m_CurrentIteration < m_NumberOfIterations; ++m_CurrentIteration)
     {
+        // 调用观察者
+        if (m_Observer && m_CurrentIteration % 10 == 0)
+        {
+            m_Observer(m_CurrentIteration, m_CurrentValue, m_CurrentStepLength);
+        }
+
         // 执行一步优化
         AdvanceOneStep();
-
-        // 调用观察者
-        if (m_Observer)
-        {
-            m_Observer(m_CurrentIteration, m_CurrentValue, m_CurrentPosition);
-        }
 
         // 检查收敛条件
         if (m_CurrentStepLength < m_MinimumStepLength)
         {
-            std::cout << "\nOptimization converged: step length below minimum" << std::endl;
+            m_StopCondition = STEP_TOO_SMALL;
             break;
         }
     }
 
-    std::cout << "\n=== Optimization Completed ===" << std::endl;
-    std::cout << "Final iteration: " << m_CurrentIteration << std::endl;
-    std::cout << "Final metric value: " << m_CurrentValue << std::endl;
-    std::cout << "Final step length: " << m_CurrentStepLength << std::endl;
+    if (m_CurrentIteration >= m_NumberOfIterations)
+    {
+        m_StopCondition = MAXIMUM_ITERATIONS;
+    }
+    
+    // 恢复最佳参数
+    if (m_ReturnBestParameters && !m_BestParameters.empty())
+    {
+        m_SetParameters(m_BestParameters);
+        m_CurrentValue = m_BestValue;
+    }
 }
 
 void RegularStepGradientDescentOptimizer::AdvanceOneStep()
 {
+    // 保存当前参数(用于可能的回退)
+    m_PreviousParameters = m_GetParameters();
+    m_PreviousValue = m_CurrentValue;
+    
     // 计算当前梯度
-    ParametersType gradient(m_CurrentPosition.size());
-    m_GradientFunction(m_CurrentPosition, gradient);
+    m_GradientFunction(m_CurrentGradient);
 
-    // 计算梯度幅值
-    double gradientMagnitude = ComputeGradientMagnitude(gradient);
-
-    if (m_CurrentIteration % 10 == 0)
-    {
-        std::cout << std::fixed << std::setprecision(6);
-        std::cout << "Iter " << std::setw(4) << m_CurrentIteration 
-                  << ": Value = " << std::setw(10) << m_CurrentValue
-                  << ", GradMag = " << std::setw(10) << gradientMagnitude
-                  << ", Step = " << std::setw(8) << m_CurrentStepLength << std::endl;
-    }
+    // 计算考虑尺度的梯度幅值
+    double gradientMagnitude = ComputeScaledGradientMagnitude(m_CurrentGradient);
 
     // 检查梯度是否过小
     if (gradientMagnitude < m_GradientMagnitudeTolerance)
     {
-        std::cout << "\nGradient magnitude below tolerance" << std::endl;
+        m_StopCondition = GRADIENT_TOO_SMALL;
+        m_CurrentStepLength = 0.0; // 触发停止
         return;
     }
 
-    // 归一化梯度
-    for (size_t i = 0; i < gradient.size(); ++i)
+    // 计算缩放后的归一化梯度方向并应用步长
+    // ITK的方式: direction = gradient / (scales^2 * magnitude)
+    // 这样每个参数的更新量 = stepLength * gradient[i] / (scales[i]^2 * magnitude)
+    std::vector<double> newParameters(m_NumberOfParameters);
+    auto currentParams = m_PreviousParameters;
+    
+    for (unsigned int i = 0; i < m_NumberOfParameters; ++i)
     {
-        gradient[i] /= gradientMagnitude;
+        double scaleFactor = m_Scales[i] * m_Scales[i];
+        double direction = m_CurrentGradient[i] / (scaleFactor * gradientMagnitude);
+        // 负方向,因为我们要最小化
+        newParameters[i] = currentParams[i] - m_CurrentStepLength * direction;
     }
 
-    // 更新参数
-    ParametersType newPosition = m_CurrentPosition;
-    for (size_t i = 0; i < newPosition.size(); ++i)
-    {
-        newPosition[i] -= m_CurrentStepLength * gradient[i];
-    }
+    // 应用新参数
+    m_SetParameters(newParameters);
 
-    // 计算新位置的代价
-    double newValue = m_CostFunction(newPosition);
+    // 计算新的代价值
+    m_CurrentValue = m_CostFunction();
 
-    // 如果代价下降,接受新位置
-    if (newValue < m_CurrentValue || m_CurrentIteration == 0)
+    // 检查是否改进
+    if (m_CurrentValue < m_PreviousValue)
     {
-        m_CurrentPosition = newPosition;
-        m_CurrentValue = newValue;
+        // 代价下降,接受这步
+        if (m_CurrentValue < m_BestValue)
+        {
+            m_BestValue = m_CurrentValue;
+            m_BestParameters = newParameters;
+        }
     }
     else
     {
-        // 如果代价上升,减小步长
+        // 代价上升或相等,回退参数并减小步长
+        m_SetParameters(m_PreviousParameters);
+        m_CurrentValue = m_PreviousValue;
         m_CurrentStepLength *= m_RelaxationFactor;
     }
 }
 
-double RegularStepGradientDescentOptimizer::ComputeGradientMagnitude(const ParametersType& gradient)
+double RegularStepGradientDescentOptimizer::ComputeScaledGradientMagnitude(const ParametersType& gradient)
 {
+    // ITK计算方式: sqrt(sum( (gradient[i] / scale[i])^2 ))
     double magnitude = 0.0;
-    for (double g : gradient)
+    for (unsigned int i = 0; i < gradient.size() && i < m_Scales.size(); ++i)
     {
-        magnitude += g * g;
+        double scaledGrad = gradient[i] / m_Scales[i];
+        magnitude += scaledGrad * scaledGrad;
     }
     return std::sqrt(magnitude);
 }

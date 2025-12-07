@@ -1,22 +1,71 @@
 #include "ImageRegistration.h"
-#include "itkIdentityTransform.h"
-#include "itkNearestNeighborInterpolateImageFunction.h"
+#include "MattesMutualInformation.h"
+#include "RegularStepGradientDescentOptimizer.h"
 #include <iostream>
+#include <iomanip>
+#include <chrono>
+#include <itkImageFileReader.h>
 
 ImageRegistration::ImageRegistration()
     : m_NumberOfHistogramBins(50)
-    , m_NumberOfSpatialSamples(10000)
-    , m_MaximumStepLength(1.0)
-    , m_MinimumStepLength(0.001)
-    , m_NumberOfIterations(200)
+    , m_NumberOfSpatialSamples(100000)
+    , m_LearningRate(0.5)
+    , m_MinimumStepLength(0.0001)
+    , m_NumberOfIterations(300)
+    , m_RelaxationFactor(0.8)
+    , m_GradientMagnitudeTolerance(1e-4)
+    , m_NumberOfLevels(3)
+    , m_RandomSeed(121212)
     , m_FinalMetricValue(0.0)
+    , m_ElapsedTime(0.0)
 {
+    // 默认多分辨率设置
+    m_ShrinkFactors = {4, 2, 1};
+    m_SmoothingSigmas = {2.0, 1.0, 0.0};
+    
     m_Metric = std::make_unique<MattesMutualInformation>();
     m_Optimizer = std::make_unique<RegularStepGradientDescentOptimizer>();
+    m_Transform = TransformType::New();
 }
 
 ImageRegistration::~ImageRegistration()
 {
+}
+
+void ImageRegistration::SetFixedImagePath(const std::string& path)
+{
+    using ReaderType = itk::ImageFileReader<ImageType>;
+    auto reader = ReaderType::New();
+    reader->SetFileName(path);
+    try
+    {
+        reader->Update();
+        m_FixedImage = reader->GetOutput();
+        std::cout << "  Fixed image loaded: " << path << std::endl;
+    }
+    catch (const itk::ExceptionObject& e)
+    {
+        std::cerr << "Error loading fixed image: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+void ImageRegistration::SetMovingImagePath(const std::string& path)
+{
+    using ReaderType = itk::ImageFileReader<ImageType>;
+    auto reader = ReaderType::New();
+    reader->SetFileName(path);
+    try
+    {
+        reader->Update();
+        m_MovingImage = reader->GetOutput();
+        std::cout << "  Moving image loaded: " << path << std::endl;
+    }
+    catch (const itk::ExceptionObject& e)
+    {
+        std::cerr << "Error loading moving image: " << e.what() << std::endl;
+        throw;
+    }
 }
 
 void ImageRegistration::SetFixedImage(ImageType::Pointer fixedImage)
@@ -29,13 +78,177 @@ void ImageRegistration::SetMovingImage(ImageType::Pointer movingImage)
     m_MovingImage = movingImage;
 }
 
-void ImageRegistration::InitializeTransformParameters()
+void ImageRegistration::ComputeGeometricCenter(ImageType::Pointer image, ImageType::PointType& center)
 {
-    // 初始化为6参数刚体变换 (3平移 + 3旋转)
-    m_FinalParameters.resize(6, 0.0);
+    auto region = image->GetLargestPossibleRegion();
+    auto size = region.GetSize();
+    auto spacing = image->GetSpacing();
+    auto origin = image->GetOrigin();
+    auto direction = image->GetDirection();
+
+    // 计算图像中心索引
+    ImageType::IndexType centerIndex;
+    for (unsigned int i = 0; i < 3; ++i)
+    {
+        centerIndex[i] = size[i] / 2;
+    }
+
+    // 转换为物理坐标
+    image->TransformIndexToPhysicalPoint(centerIndex, center);
+}
+
+void ImageRegistration::InitializeTransform()
+{
+    // 使用几何中心初始化变换
+    ImageType::PointType fixedCenter, movingCenter;
+    ComputeGeometricCenter(m_FixedImage, fixedCenter);
+    ComputeGeometricCenter(m_MovingImage, movingCenter);
+
+    // 设置旋转中心为固定图像的几何中心
+    m_Transform->SetCenter(fixedCenter);
     
-    // 可以在这里设置初始估计值
-    // 目前设置为单位变换(全0)
+    // 计算初始平移(使两个图像中心对齐)
+    TransformType::OutputVectorType initialTranslation;
+    initialTranslation[0] = movingCenter[0] - fixedCenter[0];
+    initialTranslation[1] = movingCenter[1] - fixedCenter[1];
+    initialTranslation[2] = movingCenter[2] - fixedCenter[2];
+    m_Transform->SetTranslation(initialTranslation);
+    
+    // 初始旋转为0
+    m_Transform->SetRotation(0.0, 0.0, 0.0);
+
+    std::cout << "Initial transform center: [" 
+              << fixedCenter[0] << ", " << fixedCenter[1] << ", " << fixedCenter[2] << "]" << std::endl;
+}
+
+ImageRegistration::ImageType::Pointer ImageRegistration::ShrinkImage(ImageType::Pointer image, unsigned int factor)
+{
+    if (factor <= 1)
+    {
+        return image;
+    }
+
+    using ShrinkFilterType = itk::ShrinkImageFilter<ImageType, ImageType>;
+    auto shrinkFilter = ShrinkFilterType::New();
+    shrinkFilter->SetInput(image);
+    shrinkFilter->SetShrinkFactors(factor);
+    shrinkFilter->Update();
+    return shrinkFilter->GetOutput();
+}
+
+ImageRegistration::ImageType::Pointer ImageRegistration::SmoothImage(ImageType::Pointer image, double sigma)
+{
+    if (sigma <= 0.0)
+    {
+        return image;
+    }
+
+    using SmoothingFilterType = itk::SmoothingRecursiveGaussianImageFilter<ImageType, ImageType>;
+    auto smoothFilter = SmoothingFilterType::New();
+    smoothFilter->SetInput(image);
+    smoothFilter->SetSigma(sigma);
+    smoothFilter->Update();
+    return smoothFilter->GetOutput();
+}
+
+void ImageRegistration::RunSingleLevel(ImageType::Pointer fixedImage, ImageType::Pointer movingImage, unsigned int level)
+{
+    // 配置度量
+    m_Metric->SetFixedImage(fixedImage);
+    m_Metric->SetMovingImage(movingImage);
+    m_Metric->SetNumberOfHistogramBins(m_NumberOfHistogramBins);
+    m_Metric->SetNumberOfSpatialSamples(m_NumberOfSpatialSamples);
+    m_Metric->SetRandomSeed(m_RandomSeed);
+    m_Metric->SetTransform(m_Transform);
+    m_Metric->Initialize();
+
+    // 配置优化器
+    m_Optimizer->SetLearningRate(m_LearningRate);
+    m_Optimizer->SetMinimumStepLength(m_MinimumStepLength);
+    m_Optimizer->SetNumberOfIterations(m_NumberOfIterations);
+    m_Optimizer->SetRelaxationFactor(m_RelaxationFactor);
+    m_Optimizer->SetGradientMagnitudeTolerance(m_GradientMagnitudeTolerance);
+    m_Optimizer->SetReturnBestParametersAndValue(true);
+    m_Optimizer->SetNumberOfParameters(6);
+    
+    // 设置参数尺度 - 关键！
+    // 旋转参数(rad)需要更大的尺度来限制更新幅度
+    // 平移参数(mm)需要较小的尺度
+    // ITK典型值: 旋转尺度 = 1.0, 平移尺度 = 1/translation_scale
+    // 对于医学图像, translation_scale 通常是 1000 (让平移参数更新更大)
+    std::vector<double> scales(6);
+    const double rotationScale = 1.0;
+    const double translationScale = 1.0 / 1000.0;  // 让平移更新更激进
+    scales[0] = rotationScale;  // rotation X
+    scales[1] = rotationScale;  // rotation Y
+    scales[2] = rotationScale;  // rotation Z
+    scales[3] = translationScale;  // translation X
+    scales[4] = translationScale;  // translation Y
+    scales[5] = translationScale;  // translation Z
+    m_Optimizer->SetScales(scales);
+
+    // 设置代价函数
+    m_Optimizer->SetCostFunction([this]() -> double {
+        return m_Metric->GetValue();
+    });
+
+    // 设置梯度函数
+    m_Optimizer->SetGradientFunction([this](std::vector<double>& gradient) {
+        m_Metric->GetDerivative(gradient);
+    });
+    
+    // 设置参数获取函数
+    m_Optimizer->SetGetParametersFunction([this]() -> std::vector<double> {
+        auto params = m_Transform->GetParameters();
+        std::vector<double> result(params.Size());
+        for (unsigned int i = 0; i < params.Size(); ++i)
+        {
+            result[i] = params[i];
+        }
+        return result;
+    });
+    
+    // 设置参数设置函数
+    m_Optimizer->SetSetParametersFunction([this](const std::vector<double>& params) {
+        TransformType::ParametersType itkParams(6);
+        for (unsigned int i = 0; i < 6 && i < params.size(); ++i)
+        {
+            itkParams[i] = params[i];
+        }
+        m_Transform->SetParameters(itkParams);
+    });
+
+    // 设置参数更新函数 (不再使用，保留兼容性)
+    m_Optimizer->SetUpdateParametersFunction([this](const std::vector<double>& update) {
+        auto params = m_Transform->GetParameters();
+        for (unsigned int i = 0; i < 6 && i < params.Size(); ++i)
+        {
+            params[i] += update[i];
+        }
+        m_Transform->SetParameters(params);
+    });
+
+    // 设置观察者输出
+    if (m_IterationObserver)
+    {
+        m_Optimizer->SetObserver([this](unsigned int iter, double value, double stepLength) {
+            m_IterationObserver(iter, value, stepLength);
+        });
+    }
+    else
+    {
+        m_Optimizer->SetObserver([](unsigned int iter, double value, double stepLength) {
+            std::cout << "  Iter: " << std::setw(4) << iter 
+                      << "  Metric: " << std::setw(12) << std::fixed << std::setprecision(6) << value
+                      << "  LearningRate: " << std::setw(10) << std::scientific << std::setprecision(4) << stepLength
+                      << std::endl;
+        });
+    }
+
+    // 执行优化
+    m_Optimizer->StartOptimization();
+
+    m_FinalMetricValue = m_Optimizer->GetBestValue();
 }
 
 void ImageRegistration::Update()
@@ -45,139 +258,62 @@ void ImageRegistration::Update()
         throw std::runtime_error("Fixed or moving image not set");
     }
 
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "   Image Registration Started" << std::endl;
-    std::cout << "========================================" << std::endl;
+    auto startTime = std::chrono::high_resolution_clock::now();
 
-    // 打印图像信息
+    // 初始化变换
+    InitializeTransform();
+
+    // 打印多分辨率策略
+    std::cout << "\nMulti-Resolution Strategy: " << m_NumberOfLevels << " levels" << std::endl;
+    for (unsigned int i = 0; i < m_NumberOfLevels; ++i)
+    {
+        std::cout << "  Level " << i << ": Shrink " << m_ShrinkFactors[i] 
+                  << "x, Smooth " << m_SmoothingSigmas[i] << " mm";
+        if (i == 0) std::cout << " (coarse)";
+        else if (i == m_NumberOfLevels - 1) std::cout << " (fine)";
+        else std::cout << " (medium)";
+        std::cout << std::endl;
+    }
+
+    // 计算采样信息
     auto fixedRegion = m_FixedImage->GetLargestPossibleRegion();
-    auto movingRegion = m_MovingImage->GetLargestPossibleRegion();
-    
-    std::cout << "\nFixed Image:" << std::endl;
-    std::cout << "  Size: " << fixedRegion.GetSize() << std::endl;
-    std::cout << "  Spacing: " << m_FixedImage->GetSpacing() << std::endl;
-    std::cout << "  Origin: " << m_FixedImage->GetOrigin() << std::endl;
+    auto fixedSize = fixedRegion.GetSize();
+    unsigned long totalVoxels = fixedSize[0] * fixedSize[1] * fixedSize[2];
+    double samplingPercentage = (double)m_NumberOfSpatialSamples / (double)totalVoxels * 100.0;
+    std::cout << "Using " << m_NumberOfSpatialSamples << " samples (" 
+              << std::fixed << std::setprecision(1) << samplingPercentage 
+              << "% of total voxels)\n";
 
-    std::cout << "\nMoving Image:" << std::endl;
-    std::cout << "  Size: " << movingRegion.GetSize() << std::endl;
-    std::cout << "  Spacing: " << m_MovingImage->GetSpacing() << std::endl;
-    std::cout << "  Origin: " << m_MovingImage->GetOrigin() << std::endl;
-
-    // 配置度量
-    m_Metric->SetFixedImage(m_FixedImage);
-    m_Metric->SetMovingImage(m_MovingImage);
-    m_Metric->SetNumberOfHistogramBins(m_NumberOfHistogramBins);
-    m_Metric->SetNumberOfSpatialSamples(m_NumberOfSpatialSamples);
-    
-    std::cout << "\n--- Initializing Metric ---" << std::endl;
-    m_Metric->Initialize();
-
-    // 初始化变换参数
-    InitializeTransformParameters();
-
-    // 配置优化器
-    m_Optimizer->SetMaximumStepLength(m_MaximumStepLength);
-    m_Optimizer->SetMinimumStepLength(m_MinimumStepLength);
-    m_Optimizer->SetNumberOfIterations(m_NumberOfIterations);
-    m_Optimizer->SetRelaxationFactor(0.5);
-    m_Optimizer->SetGradientMagnitudeTolerance(1e-4);
-    m_Optimizer->SetInitialPosition(m_FinalParameters);
-
-    // 设置代价函数
-    auto costFunction = [this](const ParametersType& params) -> double {
-        return m_Metric->GetValue(params);
-    };
-    m_Optimizer->SetCostFunction(costFunction);
-
-    // 设置梯度函数
-    auto gradientFunction = [this](const ParametersType& params, ParametersType& gradient) {
-        m_Metric->GetDerivative(params, gradient);
-    };
-    m_Optimizer->SetGradientFunction(gradientFunction);
-
-    // 执行优化
-    std::cout << "\n--- Starting Optimization ---" << std::endl;
-    m_Optimizer->StartOptimization();
-
-    // 获取最终结果
-    m_FinalParameters = m_Optimizer->GetCurrentPosition();
-    m_FinalMetricValue = m_Optimizer->GetCurrentValue();
-
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "   Registration Results" << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << "Final Parameters:" << std::endl;
-    std::cout << "  Translation: [" << m_FinalParameters[0] << ", " 
-              << m_FinalParameters[1] << ", " << m_FinalParameters[2] << "]" << std::endl;
-    std::cout << "  Rotation (rad): [" << m_FinalParameters[3] << ", " 
-              << m_FinalParameters[4] << ", " << m_FinalParameters[5] << "]" << std::endl;
-    std::cout << "  Rotation (deg): [" << m_FinalParameters[3] * 180.0 / 3.14159 << ", " 
-              << m_FinalParameters[4] * 180.0 / 3.14159 << ", " 
-              << m_FinalParameters[5] * 180.0 / 3.14159 << "]" << std::endl;
-    std::cout << "Final Metric Value: " << m_FinalMetricValue << std::endl;
-
-    // 应用变换生成输出图像
-    std::cout << "\n--- Generating Output Image ---" << std::endl;
-    
-    using ResampleFilterType = itk::ResampleImageFilter<ImageType, ImageType>;
-    auto resampler = ResampleFilterType::New();
-
-    // 创建仿射变换
-    auto transform = TransformType::New();
-    TransformType::ParametersType transformParams(12);
-    
-    // 提取旋转和平移
-    double tx = m_FinalParameters[0];
-    double ty = m_FinalParameters[1];
-    double tz = m_FinalParameters[2];
-    double rx = m_FinalParameters[3];
-    double ry = m_FinalParameters[4];
-    double rz = m_FinalParameters[5];
-
-    // 计算旋转矩阵
-    double cx = std::cos(rx), sx = std::sin(rx);
-    double cy = std::cos(ry), sy = std::sin(ry);
-    double cz = std::cos(rz), sz = std::sin(rz);
-
-    // 设置变换矩阵参数(ITK使用逆变换)
-    transformParams[0] = cy * cz;
-    transformParams[1] = -cy * sz;
-    transformParams[2] = sy;
-    transformParams[3] = sx * sy * cz + cx * sz;
-    transformParams[4] = -sx * sy * sz + cx * cz;
-    transformParams[5] = -sx * cy;
-    transformParams[6] = -cx * sy * cz + sx * sz;
-    transformParams[7] = cx * sy * sz + sx * cz;
-    transformParams[8] = cx * cy;
-    transformParams[9] = tx;
-    transformParams[10] = ty;
-    transformParams[11] = tz;
-
-    transform->SetParameters(transformParams);
-
-    // 配置重采样滤波器
-    resampler->SetTransform(transform);
-    resampler->SetInput(m_MovingImage);
-    resampler->SetSize(m_FixedImage->GetLargestPossibleRegion().GetSize());
-    resampler->SetOutputOrigin(m_FixedImage->GetOrigin());
-    resampler->SetOutputSpacing(m_FixedImage->GetSpacing());
-    resampler->SetOutputDirection(m_FixedImage->GetDirection());
-    resampler->SetDefaultPixelValue(0);
-
-    try
+    // 多分辨率金字塔
+    for (unsigned int level = 0; level < m_NumberOfLevels; ++level)
     {
-        resampler->Update();
-        m_OutputImage = resampler->GetOutput();
-        std::cout << "Output image generated successfully" << std::endl;
-    }
-    catch (const itk::ExceptionObject& e)
-    {
-        std::cerr << "Error during resampling: " << e << std::endl;
-        throw;
-    }
-}
+        // 调用级别观察者
+        unsigned int shrinkFactor = (level < m_ShrinkFactors.size()) ? m_ShrinkFactors[level] : 1;
+        double smoothingSigma = (level < m_SmoothingSigmas.size()) ? m_SmoothingSigmas[level] : 0.0;
+        
+        if (m_LevelObserver)
+        {
+            m_LevelObserver(level, shrinkFactor, smoothingSigma);
+        }
+        else
+        {
+            std::cout << "\n=== Multi-Resolution Level " << level << " of " << (m_NumberOfLevels - 1) << " ===" << std::endl;
+        }
 
-ImageRegistration::ImageType::Pointer ImageRegistration::GetOutput()
-{
-    return m_OutputImage;
+        // 下采样和平滑
+        ImageType::Pointer fixedPyramid = ShrinkImage(m_FixedImage, shrinkFactor);
+        fixedPyramid = SmoothImage(fixedPyramid, smoothingSigma);
+
+        ImageType::Pointer movingPyramid = ShrinkImage(m_MovingImage, shrinkFactor);
+        movingPyramid = SmoothImage(movingPyramid, smoothingSigma);
+
+        // 在当前分辨率运行配准
+        RunSingleLevel(fixedPyramid, movingPyramid, level);
+    }
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    m_ElapsedTime = std::chrono::duration<double>(endTime - startTime).count();
+
+    std::cout << "Final metric value: " << std::scientific << std::setprecision(4) 
+              << m_FinalMetricValue << std::endl;
 }

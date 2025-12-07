@@ -1,597 +1,251 @@
 #include <iostream>
 #include <string>
-#include <sstream>
 #include <filesystem>
 #include <chrono>
-#include <iomanip>
 #include <ctime>
+#include <iomanip>
+#include <sstream>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
-#include <itkImageFileReader.h>
-#include <itkImage.h>
-#include <itkEuler3DTransform.h>
-#include <itkRegularStepGradientDescentOptimizerv4.h>
-#include <itkMattesMutualInformationImageToImageMetricv4.h>
-#include <itkImageRegistrationMethodv4.h>
-#include <itkCenteredTransformInitializer.h>
+#include "ImageRegistration.h"
+
 #include <itkTransformFileWriter.h>
 
-using ImageType = itk::Image<float, 3>;
-using TransformType = itk::Euler3DTransform<double>;
+namespace fs = std::filesystem;
 
-// Forward declaration
-bool RunMattesRigidRegistration(const std::string &fixedFile, const std::string &movingFile, 
-                                TransformType::Pointer &outTransform, double &elapsedSeconds);
+// 函数声明
+std::string GenerateTimestampFilename();
+bool SaveTransformAsH5(ImageRegistration::TransformPointer transform, const std::string& outputFolder);
+void PrintUsage(const char* programName);
 
+// Windows 宽字符转 UTF-8
 #ifdef _WIN32
-static std::string WideToUtf8(const std::wstring &wstr)
+std::string WideToUtf8(const std::wstring& wstr)
 {
     if (wstr.empty()) return std::string();
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
-    std::string strTo(size_needed, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &strTo[0], size_needed, NULL, NULL);
-    if (!strTo.empty() && strTo.back() == '\0') strTo.pop_back();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), 
+                                          static_cast<int>(wstr.size()), 
+                                          nullptr, 0, nullptr, nullptr);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), 
+                        static_cast<int>(wstr.size()), 
+                        &strTo[0], size_needed, nullptr, nullptr);
     return strTo;
 }
 #endif
 
-// Save transform as HDF5 format
-bool SaveTransformAsH5(TransformType::Pointer transform, const std::string &h5FilePath)
+// 生成带时间戳的输出文件名
+std::string GenerateTimestampFilename()
 {
-    try {
-        auto writer = itk::TransformFileWriterTemplate<double>::New();
-        writer->SetFileName(h5FilePath);
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_now;
+#ifdef _WIN32
+    localtime_s(&tm_now, &time_t_now);
+#else
+    localtime_r(&time_t_now, &tm_now);
+#endif
+    
+    std::ostringstream oss;
+    oss << "registration_transform_"
+        << std::put_time(&tm_now, "%Y%m%d_%H%M%S")
+        << ".h5";
+    return oss.str();
+}
+
+// 保存变换到 HDF5 格式
+bool SaveTransformAsH5(ImageRegistration::TransformPointer transform, 
+                       const std::string& outputFolder)
+{
+    try
+    {
+        fs::path outputPath = fs::path(outputFolder) / GenerateTimestampFilename();
+        
+        // 确保输出文件夹存在
+        if (!fs::exists(outputFolder))
+        {
+            fs::create_directories(outputFolder);
+        }
+        
+        // 使用 ITK 保存变换
+        using WriterType = itk::TransformFileWriter;
+        auto writer = WriterType::New();
+        writer->SetFileName(outputPath.string());
         writer->SetInput(transform);
         writer->Update();
+        
+        std::cout << "[Transform Saved] " << outputPath.string() << std::endl;
         return true;
     }
-    catch (const itk::ExceptionObject& ex) {
-        std::cerr << "Error saving transform to H5: " << ex << std::endl;
+    catch (const std::exception& e)
+    {
+        std::cerr << "[Error] Failed to save transform: " << e.what() << std::endl;
         return false;
     }
 }
 
-#ifdef _WIN32
-int mainImplW(int argc, wchar_t** argvW)
+void PrintUsage(const char* programName)
 {
-    namespace fs = std::filesystem;
-
-    if (argc < 4) {
-        std::cout << "Usage: MIRegistration <fixed_image> <moving_image> <output_folder>\n";
-        std::cout << "  Output will be saved as transform_YYYYMMDD_HHMMSS.h5 in output_folder\n";
-        return 0;
-    }
-
-    fs::path fixedPath(argvW[1]);
-    fs::path movingPath(argvW[2]);
-    fs::path outputFolder(argvW[3]);
-
-    std::cout << "\n=== Mutual Information Registration ===\n";
-    std::cout << "Fixed:  " << WideToUtf8(fixedPath.wstring()) << std::endl;
-    std::cout << "Moving: " << WideToUtf8(movingPath.wstring()) << std::endl;
-    std::cout << "Output: " << WideToUtf8(outputFolder.wstring()) << std::endl;
-
-    if (!fs::exists(fixedPath)) {
-        std::cerr << "ERROR: Fixed image file not found: " << WideToUtf8(fixedPath.wstring()) << std::endl;
-        return 1;
-    }
-    if (!fs::exists(movingPath)) {
-        std::cerr << "ERROR: Moving image file not found: " << WideToUtf8(movingPath.wstring()) << std::endl;
-        return 1;
-    }
-
-    // Create output folder if not exists
-    if (!fs::exists(outputFolder)) {
-        fs::create_directories(outputFolder);
-    }
-
-    // Verify images can be loaded and print metadata
-    ImageType::Pointer fixedImage, movingImage;
-    try {
-        auto reader = itk::ImageFileReader<ImageType>::New();
-        reader->SetFileName(fixedPath.u8string());
-        reader->Update();
-        fixedImage = reader->GetOutput();
-        std::cout << "Fixed image loaded successfully.\n";
-        
-        auto origin = fixedImage->GetOrigin();
-        auto spacing = fixedImage->GetSpacing();
-        auto size = fixedImage->GetLargestPossibleRegion().GetSize();
-        auto direction = fixedImage->GetDirection();
-        
-        std::cout << "  Size: " << size[0] << " x " << size[1] << " x " << size[2] << "\n";
-        std::cout << "  Spacing: " << spacing[0] << ", " << spacing[1] << ", " << spacing[2] << " mm\n";
-        std::cout << "  Origin: " << origin[0] << ", " << origin[1] << ", " << origin[2] << " mm\n";
-        std::cout << "  Direction Matrix:\n";
-        for (unsigned i = 0; i < 3; ++i) {
-            std::cout << "    " << direction[i][0] << ", " << direction[i][1] << ", " << direction[i][2] << "\n";
-        }
-    }
-    catch (const itk::ExceptionObject& ex) {
-        std::cerr << "ERROR loading fixed image:\n" << ex << std::endl;
-        return 1;
-    }
-
-    try {
-        auto reader = itk::ImageFileReader<ImageType>::New();
-        reader->SetFileName(movingPath.u8string());
-        reader->Update();
-        movingImage = reader->GetOutput();
-        std::cout << "\nMoving image loaded successfully.\n";
-        
-        auto origin = movingImage->GetOrigin();
-        auto spacing = movingImage->GetSpacing();
-        auto size = movingImage->GetLargestPossibleRegion().GetSize();
-        auto direction = movingImage->GetDirection();
-        
-        std::cout << "  Size: " << size[0] << " x " << size[1] << " x " << size[2] << "\n";
-        std::cout << "  Spacing: " << spacing[0] << ", " << spacing[1] << ", " << spacing[2] << " mm\n";
-        std::cout << "  Origin: " << origin[0] << ", " << origin[1] << ", " << origin[2] << " mm\n";
-        std::cout << "  Direction Matrix:\n";
-        for (unsigned i = 0; i < 3; ++i) {
-            std::cout << "    " << direction[i][0] << ", " << direction[i][1] << ", " << direction[i][2] << "\n";
-        }
-    }
-    catch (const itk::ExceptionObject& ex) {
-        std::cerr << "ERROR loading moving image:\n" << ex << std::endl;
-        return 1;
-    }
-
-    // Run registration
-    std::cout << "\n--- Starting Registration ---\n";
-    TransformType::Pointer transform;
-    double elapsed = 0.0;
-    if (!RunMattesRigidRegistration(WideToUtf8(fixedPath.wstring()), 
-                                     WideToUtf8(movingPath.wstring()), 
-                                     transform, elapsed)) {
-        std::cerr << "ERROR: Registration failed.\n";
-        return 1;
-    }
-
-    // Print transform parameters and 4x4 matrix
-    std::cout << "\n=== Registration Results ===\n";
-    std::cout << "Time elapsed: " << std::fixed << std::setprecision(2) << elapsed << " seconds\n";
-    
-    // Print detailed transform parameters
-    std::cout << "\nTransform Parameters:\n";
-    std::cout << "  Rotation Center: " 
-              << transform->GetCenter()[0] << ", " 
-              << transform->GetCenter()[1] << ", " 
-              << transform->GetCenter()[2] << " mm\n";
-    std::cout << "  Rotation (rad): " 
-              << transform->GetAngleX() << ", " 
-              << transform->GetAngleY() << ", " 
-              << transform->GetAngleZ() << "\n";
-    std::cout << "  Translation: " 
-              << transform->GetTranslation()[0] << ", " 
-              << transform->GetTranslation()[1] << ", " 
-              << transform->GetTranslation()[2] << " mm\n";
-    
-    // Compute and print full 4x4 transformation matrix
-    // This matrix includes the rotation center offset
-    auto matrix = transform->GetMatrix();
-    auto offset = transform->GetOffset();
-    std::cout << "\n4x4 Transformation Matrix (with rotation center):\n";
-    for (unsigned r = 0; r < 3; ++r) {
-        std::cout << std::setw(12) << std::setprecision(6) << matrix[r][0] << " "
-                  << std::setw(12) << matrix[r][1] << " "
-                  << std::setw(12) << matrix[r][2] << " "
-                  << std::setw(12) << offset[r] << "\n";
-    }
-    std::cout << std::setw(12) << 0.0 << " "
-              << std::setw(12) << 0.0 << " "
-              << std::setw(12) << 0.0 << " "
-              << std::setw(12) << 1.0 << "\n";
-
-    // Generate output filename with timestamp
-    auto now = std::chrono::system_clock::now();
-    auto now_t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_buf;
-    localtime_s(&tm_buf, &now_t);
-    
-    std::ostringstream oss;
-    oss << "transform_" 
-        << std::setfill('0') << std::setw(4) << (tm_buf.tm_year + 1900)
-        << std::setw(2) << (tm_buf.tm_mon + 1)
-        << std::setw(2) << tm_buf.tm_mday << "_"
-        << std::setw(2) << tm_buf.tm_hour
-        << std::setw(2) << tm_buf.tm_min
-        << std::setw(2) << tm_buf.tm_sec
-        << ".h5";
-    
-    fs::path h5Path = outputFolder / oss.str();
-    
-    // Save transform as HDF5
-    std::cout << "\nSaving transform to: " << WideToUtf8(h5Path.wstring()) << std::endl;
-    if (SaveTransformAsH5(transform, h5Path.u8string())) {
-        std::cout << "Transform saved successfully!\n";
-    } else {
-        std::cerr << "ERROR: Failed to save transform.\n";
-        return 1;
-    }
-
-    return 0;
-}
-#endif
-
-int mainImpl(int argc, char** argv) {
-    namespace fs = std::filesystem;
-
-    if (argc < 4) {
-        std::cout << "Usage: MIRegistration <fixed_image> <moving_image> <output_folder>\n";
-        std::cout << "  Output will be saved as transform_YYYYMMDD_HHMMSS.h5 in output_folder\n";
-        return 0;
-    }
-
-    fs::path fixedPath = argv[1];
-    fs::path movingPath = argv[2];
-    fs::path outputFolder = argv[3];
-
-    std::cout << "\n=== Mutual Information Registration ===\n";
-    std::cout << "Fixed:  " << fixedPath.string() << std::endl;
-    std::cout << "Moving: " << movingPath.string() << std::endl;
-    std::cout << "Output: " << outputFolder.string() << std::endl;
-
-    if (!fs::exists(fixedPath)) {
-        std::cerr << "ERROR: Fixed image file not found: " << fixedPath.string() << std::endl;
-        return 1;
-    }
-    if (!fs::exists(movingPath)) {
-        std::cerr << "ERROR: Moving image file not found: " << movingPath.string() << std::endl;
-        return 1;
-    }
-
-    // Create output folder if not exists
-    if (!fs::exists(outputFolder)) {
-        fs::create_directories(outputFolder);
-    }
-
-    // Verify images can be loaded and print metadata
-    ImageType::Pointer fixedImage, movingImage;
-    try {
-        auto reader = itk::ImageFileReader<ImageType>::New();
-        reader->SetFileName(fixedPath.string());
-        reader->Update();
-        fixedImage = reader->GetOutput();
-        std::cout << "Fixed image loaded successfully.\n";
-        
-        auto origin = fixedImage->GetOrigin();
-        auto spacing = fixedImage->GetSpacing();
-        auto size = fixedImage->GetLargestPossibleRegion().GetSize();
-        auto direction = fixedImage->GetDirection();
-        
-        std::cout << "  Size: " << size[0] << " x " << size[1] << " x " << size[2] << "\n";
-        std::cout << "  Spacing: " << spacing[0] << ", " << spacing[1] << ", " << spacing[2] << " mm\n";
-        std::cout << "  Origin: " << origin[0] << ", " << origin[1] << ", " << origin[2] << " mm\n";
-        std::cout << "  Direction Matrix:\n";
-        for (unsigned i = 0; i < 3; ++i) {
-            std::cout << "    " << direction[i][0] << ", " << direction[i][1] << ", " << direction[i][2] << "\n";
-        }
-    }
-    catch (const itk::ExceptionObject& ex) {
-        std::cerr << "ERROR loading fixed image:\n" << ex << std::endl;
-        return 1;
-    }
-
-    try {
-        auto reader = itk::ImageFileReader<ImageType>::New();
-        reader->SetFileName(movingPath.string());
-        reader->Update();
-        movingImage = reader->GetOutput();
-        std::cout << "\nMoving image loaded successfully.\n";
-        
-        auto origin = movingImage->GetOrigin();
-        auto spacing = movingImage->GetSpacing();
-        auto size = movingImage->GetLargestPossibleRegion().GetSize();
-        auto direction = movingImage->GetDirection();
-        
-        std::cout << "  Size: " << size[0] << " x " << size[1] << " x " << size[2] << "\n";
-        std::cout << "  Spacing: " << spacing[0] << ", " << spacing[1] << ", " << spacing[2] << " mm\n";
-        std::cout << "  Origin: " << origin[0] << ", " << origin[1] << ", " << origin[2] << " mm\n";
-        std::cout << "  Direction Matrix:\n";
-        for (unsigned i = 0; i < 3; ++i) {
-            std::cout << "    " << direction[i][0] << ", " << direction[i][1] << ", " << direction[i][2] << "\n";
-        }
-    }
-    catch (const itk::ExceptionObject& ex) {
-        std::cerr << "ERROR loading moving image:\n" << ex << std::endl;
-        return 1;
-    }
-
-    // Run registration
-    std::cout << "\n--- Starting Registration ---\n";
-    TransformType::Pointer transform;
-    double elapsed = 0.0;
-    if (!RunMattesRigidRegistration(fixedPath.string(), movingPath.string(), transform, elapsed)) {
-        std::cerr << "ERROR: Registration failed.\n";
-        return 1;
-    }
-
-    // Print transform parameters and 4x4 matrix
-    std::cout << "\n=== Registration Results ===\n";
-    std::cout << "Time elapsed: " << std::fixed << std::setprecision(2) << elapsed << " seconds\n";
-    
-    // Print detailed transform parameters
-    std::cout << "\nTransform Parameters:\n";
-    std::cout << "  Rotation Center: " 
-              << transform->GetCenter()[0] << ", " 
-              << transform->GetCenter()[1] << ", " 
-              << transform->GetCenter()[2] << " mm\n";
-    std::cout << "  Rotation (rad): " 
-              << transform->GetAngleX() << ", " 
-              << transform->GetAngleY() << ", " 
-              << transform->GetAngleZ() << "\n";
-    std::cout << "  Translation: " 
-              << transform->GetTranslation()[0] << ", " 
-              << transform->GetTranslation()[1] << ", " 
-              << transform->GetTranslation()[2] << " mm\n";
-    
-    // Compute and print full 4x4 transformation matrix
-    // This matrix includes the rotation center offset
-    auto matrix = transform->GetMatrix();
-    auto offset = transform->GetOffset();
-    std::cout << "\n4x4 Transformation Matrix (with rotation center):\n";
-    for (unsigned r = 0; r < 3; ++r) {
-        std::cout << std::setw(12) << std::setprecision(6) << matrix[r][0] << " "
-                  << std::setw(12) << matrix[r][1] << " "
-                  << std::setw(12) << matrix[r][2] << " "
-                  << std::setw(12) << offset[r] << "\n";
-    }
-    std::cout << std::setw(12) << 0.0 << " "
-              << std::setw(12) << 0.0 << " "
-              << std::setw(12) << 0.0 << " "
-              << std::setw(12) << 1.0 << "\n";
-
-    // Generate output filename with timestamp
-    auto now = std::chrono::system_clock::now();
-    auto now_t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_buf;
-#ifdef _WIN32
-    localtime_s(&tm_buf, &now_t);
-#else
-    localtime_r(&now_t, &tm_buf);
-#endif
-    
-    std::ostringstream oss;
-    oss << "transform_" 
-        << std::setfill('0') << std::setw(4) << (tm_buf.tm_year + 1900)
-        << std::setw(2) << (tm_buf.tm_mon + 1)
-        << std::setw(2) << tm_buf.tm_mday << "_"
-        << std::setw(2) << tm_buf.tm_hour
-        << std::setw(2) << tm_buf.tm_min
-        << std::setw(2) << tm_buf.tm_sec
-        << ".h5";
-    
-    fs::path h5Path = outputFolder / oss.str();
-    
-    // Save transform as HDF5
-    std::cout << "\nSaving transform to: " << h5Path.string() << std::endl;
-    if (SaveTransformAsH5(transform, h5Path.string())) {
-        std::cout << "Transform saved successfully!\n";
-    } else {
-        std::cerr << "ERROR: Failed to save transform.\n";
-        return 1;
-    }
-
-    return 0;
+    std::cout << "Usage: " << programName << " <fixed_image> <moving_image> <output_folder>\n"
+              << "\n"
+              << "Arguments:\n"
+              << "  fixed_image   - Path to the fixed (reference) image (MRI/CT)\n"
+              << "  moving_image  - Path to the moving image to be registered\n"
+              << "  output_folder - Folder path for output .h5 transform file\n"
+              << "\n"
+              << "Supported formats: NIFTI (.nii, .nii.gz), NRRD (.nrrd), MetaImage (.mhd/.mha)\n"
+              << std::endl;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char* argv[])
+{
+    std::cout << "=== Mutual Information Registration (Custom Implementation) ===" << std::endl;
+    std::cout << "Multi-Resolution 3D Rigid Registration for MRI/CT Images" << std::endl;
+    std::cout << "============================================================\n" << std::endl;
+
 #ifdef _WIN32
-    int wargc = 0;
-    wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-    if (wargv != nullptr) {
-        int ret = mainImplW(wargc, wargv);
+    // Windows: 使用宽字符 API 支持中文路径
+    int wargc;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    
+    if (wargc < 4)
+    {
         LocalFree(wargv);
-        return ret;
+        PrintUsage(argv[0]);
+        return EXIT_FAILURE;
     }
+    
+    std::string fixedImagePath = WideToUtf8(wargv[1]);
+    std::string movingImagePath = WideToUtf8(wargv[2]);
+    std::string outputFolder = WideToUtf8(wargv[3]);
+    LocalFree(wargv);
+#else
+    if (argc < 4)
+    {
+        PrintUsage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    
+    std::string fixedImagePath = argv[1];
+    std::string movingImagePath = argv[2];
+    std::string outputFolder = argv[3];
 #endif
-    return mainImpl(argc, argv);
-}
 
-bool RunMattesRigidRegistration(const std::string &fixedFile, const std::string &movingFile, TransformType::Pointer &outTransform, double &elapsedSeconds)
-{
-    using FixedImageType = ImageType;
-    using MovingImageType = ImageType;
+    std::cout << "[Input Configuration]" << std::endl;
+    std::cout << "  Fixed Image:  " << fixedImagePath << std::endl;
+    std::cout << "  Moving Image: " << movingImagePath << std::endl;
+    std::cout << "  Output Folder: " << outputFolder << std::endl;
+    std::cout << std::endl;
 
-    // Readers
-    auto fixedReader = itk::ImageFileReader<FixedImageType>::New();
-    fixedReader->SetFileName(fixedFile);
-    auto movingReader = itk::ImageFileReader<MovingImageType>::New();
-    movingReader->SetFileName(movingFile);
-
-    try {
-        fixedReader->Update();
-        movingReader->Update();
-    }
-    catch (const itk::ExceptionObject &ex) {
-        std::cerr << "Image read error: " << ex << std::endl;
-        return false;
-    }
-
-    auto fixedImage = fixedReader->GetOutput();
-    auto movingImage = movingReader->GetOutput();
-
-    // Initial transform (centered)
-    auto initialTransform = TransformType::New();
-    using InitializerType = itk::CenteredTransformInitializer<TransformType, FixedImageType, MovingImageType>;
-    auto initializer = InitializerType::New();
-    initializer->SetTransform(initialTransform);
-    initializer->SetFixedImage(fixedImage);
-    initializer->SetMovingImage(movingImage);
-    initializer->GeometryOn();  // 使用几何中心而不是质心,更稳定
-    initializer->InitializeTransform();
-
-    std::cout << "Initial transform center: " << initialTransform->GetCenter() << std::endl;
-
-    // Metric
-    using MetricType = itk::MattesMutualInformationImageToImageMetricv4<FixedImageType, MovingImageType>;
-    auto metric = MetricType::New();
-    metric->SetNumberOfHistogramBins(50);
-    metric->SetUseMovingImageGradientFilter(false);  // 提高稳定性
-    metric->SetUseFixedImageGradientFilter(false);
-
-    // Optimizer
-    using OptimizerType = itk::RegularStepGradientDescentOptimizerv4<double>;
-    auto optimizer = OptimizerType::New();
-    optimizer->SetLearningRate(0.5);  // 降低学习率提高稳定性
-    optimizer->SetMinimumStepLength(0.0001);
-    optimizer->SetNumberOfIterations(300);  // 增加迭代次数
-    optimizer->SetRelaxationFactor(0.8);  // 增加松弛因子
-    optimizer->SetGradientMagnitudeTolerance(1e-4);
-    optimizer->SetReturnBestParametersAndValue(true);  // 返回最佳参数
-
-    // Registration - 需要先定义,因为Observer会引用它
-    using RegistrationType = itk::ImageRegistrationMethodv4<FixedImageType, MovingImageType, TransformType>;
-    auto registration = RegistrationType::New();
-    registration->SetFixedImage(fixedImage);
-    registration->SetMovingImage(movingImage);
-    registration->SetMetric(metric);
-    registration->SetOptimizer(optimizer);
-    registration->SetInitialTransform(initialTransform);
-
-    // Add observer to print iteration progress
-    class IterationObserver : public itk::Command
+    // 验证输入文件存在
+    if (!fs::exists(fixedImagePath))
     {
-    public:
-        using Self = IterationObserver;
-        using Superclass = itk::Command;
-        using Pointer = itk::SmartPointer<Self>;
-        itkNewMacro(Self);
-
-    protected:
-        IterationObserver() = default;
-
-    public:
-        void Execute(itk::Object *caller, const itk::EventObject &event) override
-        {
-            Execute((const itk::Object *)caller, event);
-        }
-
-        void Execute(const itk::Object *object, const itk::EventObject &event) override
-        {
-            auto optimizer = static_cast<const OptimizerType *>(object);
-            if (!itk::IterationEvent().CheckEvent(&event))
-            {
-                return;
-            }
-
-            unsigned int iter = optimizer->GetCurrentIteration();
-            double value = optimizer->GetValue();
-            double learningRate = optimizer->GetLearningRate();
-
-            // Print progress every 10 iterations or at the first iteration
-            if (iter % 10 == 0 || iter == 0)
-            {
-                std::cout << "  Iter: " << std::setw(4) << iter 
-                          << "  Metric: " << std::setw(12) << std::fixed << std::setprecision(6) << value
-                          << "  LearningRate: " << std::setw(10) << std::scientific << std::setprecision(4) << learningRate
-                          << std::endl;
-            }
-        }
-    };
-
-    // Add observer for multi-resolution level changes
-    class MultiResolutionObserver : public itk::Command
+        std::cerr << "[Error] Fixed image not found: " << fixedImagePath << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!fs::exists(movingImagePath))
     {
-    public:
-        using Self = MultiResolutionObserver;
-        using Superclass = itk::Command;
-        using Pointer = itk::SmartPointer<Self>;
-        itkNewMacro(Self);
-
-    protected:
-        MultiResolutionObserver() = default;
-
-    public:
-        void Execute(itk::Object *caller, const itk::EventObject &event) override
-        {
-            Execute((const itk::Object *)caller, event);
-        }
-
-        void Execute(const itk::Object *object, const itk::EventObject &event) override
-        {
-            if (!itk::MultiResolutionIterationEvent().CheckEvent(&event))
-            {
-                return;
-            }
-
-            auto registration = static_cast<const RegistrationType *>(object);
-            unsigned int level = registration->GetCurrentLevel();
-            unsigned int totalLevels = registration->GetNumberOfLevels();
-            
-            std::cout << "\n=== Multi-Resolution Level " << level << " of " << (totalLevels - 1) << " ===" << std::endl;
-        }
-    };
-
-    auto iterObserver = IterationObserver::New();
-    optimizer->AddObserver(itk::IterationEvent(), iterObserver);
-
-    auto multiResObserver = MultiResolutionObserver::New();
-    registration->AddObserver(itk::MultiResolutionIterationEvent(), multiResObserver);
-    
-    // Configure multi-resolution pyramid (默认是3层)
-    // 你可以修改这些参数来调整金字塔策略
-    constexpr unsigned int numberOfLevels = 3;
-    RegistrationType::ShrinkFactorsArrayType shrinkFactorsPerLevel;
-    shrinkFactorsPerLevel.SetSize(numberOfLevels);
-    shrinkFactorsPerLevel[0] = 4;  // 第一层: 下采样4倍 (粗略对齐)
-    shrinkFactorsPerLevel[1] = 2;  // 第二层: 下采样2倍 (中等精度)
-    shrinkFactorsPerLevel[2] = 1;  // 第三层: 原始分辨率 (精细对齐)
-    
-    RegistrationType::SmoothingSigmasArrayType smoothingSigmasPerLevel;
-    smoothingSigmasPerLevel.SetSize(numberOfLevels);
-    smoothingSigmasPerLevel[0] = 2.0;  // 第一层: 高斯平滑2mm
-    smoothingSigmasPerLevel[1] = 1.0;  // 第二层: 高斯平滑1mm
-    smoothingSigmasPerLevel[2] = 0.0;  // 第三层: 不平滑
-    
-    registration->SetNumberOfLevels(numberOfLevels);
-    registration->SetShrinkFactorsPerLevel(shrinkFactorsPerLevel);
-    registration->SetSmoothingSigmasPerLevel(smoothingSigmasPerLevel);
-    registration->SmoothingSigmasAreSpecifiedInPhysicalUnitsOn();  // 平滑参数单位是mm
-
-    std::cout << "\nMulti-Resolution Strategy: " << numberOfLevels << " levels" << std::endl;
-    std::cout << "  Level 0: Shrink " << shrinkFactorsPerLevel[0] << "x, Smooth " << smoothingSigmasPerLevel[0] << " mm (coarse)" << std::endl;
-    std::cout << "  Level 1: Shrink " << shrinkFactorsPerLevel[1] << "x, Smooth " << smoothingSigmasPerLevel[1] << " mm (medium)" << std::endl;
-    std::cout << "  Level 2: Shrink " << shrinkFactorsPerLevel[2] << "x, Smooth " << smoothingSigmasPerLevel[2] << " mm (fine)" << std::endl;
-
-    // 使用固定种子的确定性采样,确保可重复性
-    auto fixedRegion = fixedImage->GetLargestPossibleRegion();
-    auto fixedSize = fixedRegion.GetSize();
-    unsigned long totalVoxels = fixedSize[0] * fixedSize[1] * fixedSize[2];
-    unsigned long maxSamples = 100000;  // 增加采样数提高稳定性
-    unsigned long numSamples = (totalVoxels < maxSamples) ? totalVoxels : maxSamples;
-    double samplingPercentage = (double)numSamples / (double)totalVoxels;
-    
-    registration->SetMetricSamplingPercentage(samplingPercentage);
-    registration->SetMetricSamplingStrategy(RegistrationType::RANDOM);
-    registration->MetricSamplingReinitializeSeed(121212);  // 固定随机种子!
-
-    std::cout << "Using " << numSamples << " samples (" 
-              << std::fixed << std::setprecision(1) << (samplingPercentage * 100) 
-              << "% of total voxels)\n";
-
-    auto startTime = std::chrono::high_resolution_clock::now();
-
-    try {
-        registration->Update();
-    }
-    catch (const itk::ExceptionObject &ex) {
-        std::cerr << "Registration error: " << ex << std::endl;
-        return false;
+        std::cerr << "[Error] Moving image not found: " << movingImagePath << std::endl;
+        return EXIT_FAILURE;
     }
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    elapsedSeconds = std::chrono::duration<double>(endTime - startTime).count();
-
-    // 获取最优值
-    auto bestValue = optimizer->GetValue();
-    std::cout << "Final metric value: " << bestValue << std::endl;
-
-    outTransform = const_cast<TransformType*>(registration->GetOutput()->Get());
-
-    return true;
+    try
+    {
+        // 创建配准对象
+        ImageRegistration registration;
+        
+        // 设置图像
+        std::cout << "[Loading Images...]" << std::endl;
+        registration.SetFixedImagePath(fixedImagePath);
+        registration.SetMovingImagePath(movingImagePath);
+        
+        // 配置多分辨率参数
+        registration.SetNumberOfLevels(3);
+        registration.SetShrinkFactors({4, 2, 1});
+        registration.SetSmoothingSigmas({2.0, 1.0, 0.0});
+        
+        // 配置优化器参数
+        registration.SetLearningRate(0.5);
+        registration.SetMinimumStepLength(0.0001);
+        registration.SetNumberOfIterations(300);
+        registration.SetRelaxationFactor(0.8);
+        registration.SetGradientMagnitudeTolerance(1e-4);
+        
+        // 配置度量参数
+        registration.SetNumberOfHistogramBins(50);
+        registration.SetNumberOfSamples(100000);
+        
+        // 设置迭代观察者
+        registration.SetIterationObserver([](int iteration, double value, double stepLength) {
+            std::cout << "  Iteration " << std::setw(4) << iteration 
+                      << " | MI Value: " << std::fixed << std::setprecision(6) << value
+                      << " | Step: " << std::scientific << std::setprecision(2) << stepLength
+                      << std::endl;
+        });
+        
+        // 设置多分辨率级别观察者
+        registration.SetLevelObserver([](int level, int shrinkFactor, double sigma) {
+            std::cout << "\n[Multi-Resolution Level " << (level + 1) << "]" << std::endl;
+            std::cout << "  Shrink Factor: " << shrinkFactor << "x" << std::endl;
+            std::cout << "  Smoothing Sigma: " << sigma << " mm" << std::endl;
+        });
+        
+        // 执行配准
+        std::cout << "\n[Starting Registration...]" << std::endl;
+        registration.Update();
+        
+        // 获取结果
+        auto finalTransform = registration.GetFinalTransform();
+        double elapsedTime = registration.GetElapsedTime();
+        
+        // 输出结果
+        std::cout << "\n[Registration Completed]" << std::endl;
+        std::cout << "  Total Time: " << std::fixed << std::setprecision(2) 
+                  << elapsedTime << " seconds" << std::endl;
+        
+        // 输出变换参数
+        auto parameters = finalTransform->GetParameters();
+        std::cout << "\n[Final Transform Parameters]" << std::endl;
+        std::cout << "  Rotation (rad):    [" 
+                  << std::fixed << std::setprecision(6)
+                  << parameters[0] << ", " 
+                  << parameters[1] << ", " 
+                  << parameters[2] << "]" << std::endl;
+        std::cout << "  Translation (mm):  [" 
+                  << std::fixed << std::setprecision(4)
+                  << parameters[3] << ", " 
+                  << parameters[4] << ", " 
+                  << parameters[5] << "]" << std::endl;
+        
+        auto center = finalTransform->GetCenter();
+        std::cout << "  Rotation Center:   [" 
+                  << std::fixed << std::setprecision(2)
+                  << center[0] << ", " 
+                  << center[1] << ", " 
+                  << center[2] << "]" << std::endl;
+        
+        // 保存变换
+        std::cout << "\n[Saving Transform...]" << std::endl;
+        if (!SaveTransformAsH5(finalTransform, outputFolder))
+        {
+            return EXIT_FAILURE;
+        }
+        
+        std::cout << "\n=== Registration Successfully Completed ===" << std::endl;
+        return EXIT_SUCCESS;
+    }
+    catch (const itk::ExceptionObject& e)
+    {
+        std::cerr << "\n[ITK Error] " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "\n[Error] " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
 }

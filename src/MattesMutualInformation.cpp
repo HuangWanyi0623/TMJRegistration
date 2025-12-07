@@ -1,19 +1,23 @@
 #include "MattesMutualInformation.h"
 #include "itkImageRegionConstIteratorWithIndex.h"
 #include <cmath>
-#include <random>
 #include <algorithm>
 #include <iostream>
+#include <iomanip>
 
 MattesMutualInformation::MattesMutualInformation()
     : m_NumberOfHistogramBins(50)
-    , m_NumberOfSpatialSamples(10000)
+    , m_NumberOfSpatialSamples(100000)
+    , m_RandomSeed(121212)
+    , m_UseFixedSeed(true)
     , m_FixedImageMin(0.0)
     , m_FixedImageMax(1.0)
     , m_MovingImageMin(0.0)
     , m_MovingImageMax(1.0)
+    , m_CurrentValue(0.0)
 {
     m_Interpolator = InterpolatorType::New();
+    m_RandomGenerator.seed(m_RandomSeed);
 }
 
 MattesMutualInformation::~MattesMutualInformation()
@@ -38,6 +42,12 @@ void MattesMutualInformation::Initialize()
         throw std::runtime_error("Fixed or moving image not set");
     }
 
+    // 使用固定种子确保可重复性
+    if (m_UseFixedSeed)
+    {
+        m_RandomGenerator.seed(m_RandomSeed);
+    }
+
     // 计算图像强度范围
     ComputeImageExtrema();
 
@@ -49,12 +59,16 @@ void MattesMutualInformation::Initialize()
                      std::vector<double>(m_NumberOfHistogramBins, 0.0));
     m_FixedImageMarginalPDF.resize(m_NumberOfHistogramBins, 0.0);
     m_MovingImageMarginalPDF.resize(m_NumberOfHistogramBins, 0.0);
+}
 
-    std::cout << "MattesMutualInformation initialized:" << std::endl;
-    std::cout << "  Number of histogram bins: " << m_NumberOfHistogramBins << std::endl;
-    std::cout << "  Number of samples: " << m_SamplePoints.size() << std::endl;
-    std::cout << "  Fixed image range: [" << m_FixedImageMin << ", " << m_FixedImageMax << "]" << std::endl;
-    std::cout << "  Moving image range: [" << m_MovingImageMin << ", " << m_MovingImageMax << "]" << std::endl;
+void MattesMutualInformation::ReinitializeSampling()
+{
+    // 重新使用固定种子
+    if (m_UseFixedSeed)
+    {
+        m_RandomGenerator.seed(m_RandomSeed);
+    }
+    SampleFixedImage();
 }
 
 void MattesMutualInformation::ComputeImageExtrema()
@@ -97,7 +111,7 @@ void MattesMutualInformation::SampleFixedImage()
     using IteratorType = itk::ImageRegionConstIteratorWithIndex<ImageType>;
     ImageType::RegionType region = m_FixedImage->GetLargestPossibleRegion();
     
-    // 收集所有有效点
+    // 收集所有有效点的索引
     std::vector<ImageType::IndexType> allIndices;
     IteratorType it(m_FixedImage, region);
     
@@ -106,10 +120,8 @@ void MattesMutualInformation::SampleFixedImage()
         allIndices.push_back(it.GetIndex());
     }
 
-    // 随机打乱并选择采样点
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::shuffle(allIndices.begin(), allIndices.end(), gen);
+    // 使用固定种子随机打乱
+    std::shuffle(allIndices.begin(), allIndices.end(), m_RandomGenerator);
 
     unsigned int numSamples = std::min(m_NumberOfSpatialSamples, 
                                       static_cast<unsigned int>(allIndices.size()));
@@ -126,8 +138,13 @@ void MattesMutualInformation::SampleFixedImage()
     }
 }
 
-void MattesMutualInformation::ComputeJointPDF(const ParametersType& parameters)
+void MattesMutualInformation::ComputeJointPDF()
 {
+    if (!m_Transform)
+    {
+        throw std::runtime_error("Transform not set in metric");
+    }
+
     // 清空直方图
     for (auto& row : m_JointPDF)
     {
@@ -141,9 +158,8 @@ void MattesMutualInformation::ComputeJointPDF(const ParametersType& parameters)
     // 遍历所有采样点
     for (const auto& sample : m_SamplePoints)
     {
-        // 应用变换
-        ImageType::PointType transformedPoint;
-        ApplyTransform(sample.point, parameters, transformedPoint);
+        // 使用变换将固定图像点变换到移动图像空间
+        ImageType::PointType transformedPoint = m_Transform->TransformPoint(sample.point);
 
         // 检查变换后的点是否在移动图像范围内
         if (!m_Interpolator->IsInsideBuffer(transformedPoint))
@@ -211,88 +227,67 @@ double MattesMutualInformation::ComputeMutualInformation()
     return mutualInformation;
 }
 
-double MattesMutualInformation::GetValue(const ParametersType& parameters)
+double MattesMutualInformation::GetValue()
 {
-    ComputeJointPDF(parameters);
+    ComputeJointPDF();
     double mi = ComputeMutualInformation();
-    return -mi; // 返回负值,因为我们要最小化
+    m_CurrentValue = -mi; // 返回负值,因为我们要最小化
+    return m_CurrentValue;
 }
 
-void MattesMutualInformation::GetDerivative(const ParametersType& parameters, 
-                                           ParametersType& derivative)
+void MattesMutualInformation::GetDerivative(ParametersType& derivative)
 {
     // 使用有限差分法计算梯度
-    derivative.resize(parameters.size());
-    const double delta = 1e-4;
-
-    double baseValue = GetValue(parameters);
-
-    for (size_t i = 0; i < parameters.size(); ++i)
-    {
-        ParametersType perturbedParams = parameters;
-        perturbedParams[i] += delta;
-        double perturbedValue = GetValue(perturbedParams);
-        derivative[i] = (perturbedValue - baseValue) / delta;
-    }
-}
-
-void MattesMutualInformation::GetValueAndDerivative(const ParametersType& parameters,
-                                                   double& value,
-                                                   ParametersType& derivative)
-{
-    value = GetValue(parameters);
-    GetDerivative(parameters, derivative);
-}
-
-void MattesMutualInformation::ApplyTransform(const ImageType::PointType& inputPoint,
-                                            const ParametersType& parameters,
-                                            ImageType::PointType& outputPoint)
-{
-    // 简化的仿射变换: 6个参数 (3个平移 + 3个旋转)
-    // 实际应用中可以扩展为完整的12参数仿射变换
+    // 对于Euler3DTransform: 参数0-2是旋转(rad), 参数3-5是平移(mm)
+    const unsigned int numParams = 6;
+    derivative.resize(numParams);
     
-    if (parameters.size() < 6)
+    // 不同参数类型使用不同的扰动量
+    // 旋转参数用小扰动(弧度), 平移参数用较大扰动(毫米)
+    const double rotationDelta = 1e-4;    // ~0.006 degrees
+    const double translationDelta = 0.01;  // 0.01 mm
+
+    // 保存当前变换参数
+    auto currentParams = m_Transform->GetParameters();
+    
+    // 使用中心差分法,更准确
+    for (unsigned int i = 0; i < numParams; ++i)
     {
-        outputPoint = inputPoint;
-        return;
+        double delta = (i < 3) ? rotationDelta : translationDelta;
+        
+        // 正向扰动
+        auto forwardParams = currentParams;
+        forwardParams[i] += delta;
+        m_Transform->SetParameters(forwardParams);
+        double forwardValue = GetValue();
+        
+        // 负向扰动
+        auto backwardParams = currentParams;
+        backwardParams[i] -= delta;
+        m_Transform->SetParameters(backwardParams);
+        double backwardValue = GetValue();
+        
+        // 中心差分
+        derivative[i] = (forwardValue - backwardValue) / (2.0 * delta);
     }
 
-    // 提取参数
-    double tx = parameters[0];
-    double ty = parameters[1];
-    double tz = parameters[2];
-    double rx = parameters[3]; // 绕X轴旋转(弧度)
-    double ry = parameters[4]; // 绕Y轴旋转
-    double rz = parameters[5]; // 绕Z轴旋转
+    // 恢复原始参数
+    m_Transform->SetParameters(currentParams);
+    // 重新计算当前值
+    m_CurrentValue = GetValue();
+}
 
-    // 计算旋转矩阵 (ZYX欧拉角)
-    double cx = std::cos(rx), sx = std::sin(rx);
-    double cy = std::cos(ry), sy = std::sin(ry);
-    double cz = std::cos(rz), sz = std::sin(rz);
-
-    // 组合旋转矩阵
-    double r00 = cy * cz;
-    double r01 = -cy * sz;
-    double r02 = sy;
-    double r10 = sx * sy * cz + cx * sz;
-    double r11 = -sx * sy * sz + cx * cz;
-    double r12 = -sx * cy;
-    double r20 = -cx * sy * cz + sx * sz;
-    double r21 = cx * sy * sz + sx * cz;
-    double r22 = cx * cy;
-
-    // 应用旋转和平移
-    double x = inputPoint[0];
-    double y = inputPoint[1];
-    double z = inputPoint[2];
-
-    outputPoint[0] = r00 * x + r01 * y + r02 * z + tx;
-    outputPoint[1] = r10 * x + r11 * y + r12 * z + ty;
-    outputPoint[2] = r20 * x + r21 * y + r22 * z + tz;
+void MattesMutualInformation::GetValueAndDerivative(double& value, ParametersType& derivative)
+{
+    value = GetValue();
+    GetDerivative(derivative);
 }
 
 int MattesMutualInformation::ComputeFixedImageBin(double value) const
 {
+    if (m_FixedImageMax <= m_FixedImageMin)
+        return 0;
+        
     if (value <= m_FixedImageMin)
         return 0;
     if (value >= m_FixedImageMax)
@@ -306,6 +301,9 @@ int MattesMutualInformation::ComputeFixedImageBin(double value) const
 
 int MattesMutualInformation::ComputeMovingImageBin(double value) const
 {
+    if (m_MovingImageMax <= m_MovingImageMin)
+        return 0;
+        
     if (value <= m_MovingImageMin)
         return 0;
     if (value >= m_MovingImageMax)

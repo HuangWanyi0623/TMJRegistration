@@ -2,17 +2,28 @@
 
 ## 项目简介
 
-这是一个用C++实现的基于Mattes互信息的3D医学图像配准工具,专门用于MRI和CT图像的精配准。本项目借鉴ITK的设计理念实现核心算法,便于后续改进和优化。
+这是一个用C++实现的基于Mattes互信息的3D医学图像配准工具,专门用于MRI和CT图像的精配准。本项目**自定义实现**核心算法,便于后续改进和优化。
 
 > **快速开始**: 如果您是第一次使用,请先阅读 [QUICKSTART.md](QUICKSTART.md)
 
 ### 主要特性
 
-- **Mattes互信息度量**: 使用直方图方法估计联合概率分布
-- **梯度下降优化器**: 自适应步长调整,自动收敛
+- **Mattes互信息度量**: 自定义实现,使用直方图方法估计联合概率分布
+- **梯度下降优化器**: 自定义实现,自适应步长调整,自动收敛
+- **多分辨率金字塔**: 自定义实现,3层金字塔策略加速收敛
 - **刚体变换**: 支持3D平移和旋转 (6参数)
 - **DICOM/NRRD支持**: 直接读取医学图像格式
-- **高效采样**: 随机采样策略加速计算
+- **高效采样**: 固定种子随机采样,确保可重复性
+
+### 自定义实现的类
+
+本项目核心算法完全自定义实现,方便扩展和修改:
+
+| 类名 | 文件 | 说明 |
+|------|------|------|
+| `MattesMutualInformation` | `src/MattesMutualInformation.cpp` | Mattes互信息度量 |
+| `RegularStepGradientDescentOptimizer` | `src/RegularStepGradientDescentOptimizer.cpp` | 规则步长梯度下降优化器 |
+| `ImageRegistration` | `src/ImageRegistration.cpp` | 配准框架(含多分辨率金字塔) |
 
 ## 环境要求
 
