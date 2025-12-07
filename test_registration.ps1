@@ -18,7 +18,7 @@ Write-Host "`nPlease provide the following image files:" -ForegroundColor Yellow
 Write-Host "(Supported formats: .nrrd, .nii, .nii.gz, .mha, .mhd, DICOM)" -ForegroundColor Gray
 $fixed = Read-Host "Fixed image path"
 $moving = Read-Host "Moving image path"
-$output = Read-Host "Output image path"
+$output = Read-Host "Output folder path (for .h5 transform file)"
 
 # 检查输入文件是否存在
 if (-not (Test-Path $fixed)) {
@@ -44,7 +44,7 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "`n========================================" -ForegroundColor Cyan
     Write-Host "  Registration Completed!" -ForegroundColor Green
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "`nOutput saved to: $output" -ForegroundColor Yellow
+    Write-Host "`nTransform (.h5) saved to folder: $output" -ForegroundColor Yellow
 } else {
     Write-Host "`n[!] Registration failed with error code: $LASTEXITCODE" -ForegroundColor Red
 }
