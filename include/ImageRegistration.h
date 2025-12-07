@@ -124,6 +124,10 @@ private:
     
     // 计算图像几何中心
     void ComputeGeometricCenter(ImageType::Pointer image, ImageType::PointType& center);
+    
+    // 自动估算参数尺度 (类似ITK的RegistrationParameterScalesEstimator)
+    std::vector<double> EstimateParameterScales();
+    double ComputePhysicalRadius(ImageType::Pointer image);
 };
 
 #endif // IMAGEREGISTRATION_H

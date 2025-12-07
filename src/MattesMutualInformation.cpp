@@ -1,28 +1,48 @@
 #include "MattesMutualInformation.h"
 #include "itkImageRegionConstIteratorWithIndex.h"
+#include "itkGradientImageFilter.h"
 #include <cmath>
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+#include <numeric>
+
+// ============================================================================
+// 构造函数和析构函数
+// ============================================================================
 
 MattesMutualInformation::MattesMutualInformation()
     : m_NumberOfHistogramBins(50)
     , m_NumberOfSpatialSamples(100000)
     , m_RandomSeed(121212)
     , m_UseFixedSeed(true)
+    , m_UseStratifiedSampling(true)  // 默认使用分层采样
+    , m_NumberOfValidSamples(0)
     , m_FixedImageMin(0.0)
     , m_FixedImageMax(1.0)
     , m_MovingImageMin(0.0)
     , m_MovingImageMax(1.0)
+    , m_FixedImageBinSize(1.0)
+    , m_MovingImageBinSize(1.0)
     , m_CurrentValue(0.0)
 {
     m_Interpolator = InterpolatorType::New();
     m_RandomGenerator.seed(m_RandomSeed);
+    
+    // 初始化梯度插值器
+    for (int i = 0; i < 3; ++i)
+    {
+        m_GradientInterpolators[i] = InterpolatorType::New();
+    }
 }
 
 MattesMutualInformation::~MattesMutualInformation()
 {
 }
+
+// ============================================================================
+// 设置图像
+// ============================================================================
 
 void MattesMutualInformation::SetFixedImage(ImageType::Pointer fixedImage)
 {
@@ -34,6 +54,10 @@ void MattesMutualInformation::SetMovingImage(ImageType::Pointer movingImage)
     m_MovingImage = movingImage;
     m_Interpolator->SetInputImage(m_MovingImage);
 }
+
+// ============================================================================
+// 初始化
+// ============================================================================
 
 void MattesMutualInformation::Initialize()
 {
@@ -50,20 +74,38 @@ void MattesMutualInformation::Initialize()
 
     // 计算图像强度范围
     ComputeImageExtrema();
+    
+    // 计算bin大小
+    // ITK在边界各留2个bin的padding用于B样条
+    const unsigned int padding = 2;
+    m_FixedImageBinSize = (m_FixedImageMax - m_FixedImageMin) / 
+                          static_cast<double>(m_NumberOfHistogramBins - 2 * padding - 1);
+    m_MovingImageBinSize = (m_MovingImageMax - m_MovingImageMin) / 
+                           static_cast<double>(m_NumberOfHistogramBins - 2 * padding - 1);
+    
+    // 计算移动图像梯度(用于解析梯度)
+    ComputeMovingImageGradient();
 
     // 在固定图像上采样
     SampleFixedImage();
 
-    // 初始化直方图
+    // 初始化直方图 (加padding用于B样条边界处理)
     m_JointPDF.resize(m_NumberOfHistogramBins, 
                      std::vector<double>(m_NumberOfHistogramBins, 0.0));
     m_FixedImageMarginalPDF.resize(m_NumberOfHistogramBins, 0.0);
     m_MovingImageMarginalPDF.resize(m_NumberOfHistogramBins, 0.0);
+    
+    // 初始化梯度PDF存储 (6个参数)
+    m_JointPDFDerivatives.resize(6);
+    for (auto& paramDerivative : m_JointPDFDerivatives)
+    {
+        paramDerivative.resize(m_NumberOfHistogramBins,
+                              std::vector<double>(m_NumberOfHistogramBins, 0.0));
+    }
 }
 
 void MattesMutualInformation::ReinitializeSampling()
 {
-    // 重新使用固定种子
     if (m_UseFixedSeed)
     {
         m_RandomGenerator.seed(m_RandomSeed);
@@ -71,12 +113,16 @@ void MattesMutualInformation::ReinitializeSampling()
     SampleFixedImage();
 }
 
+// ============================================================================
+// 图像极值计算
+// ============================================================================
+
 void MattesMutualInformation::ComputeImageExtrema()
 {
-    // 计算固定图像的最小最大值
     using IteratorType = itk::ImageRegionConstIteratorWithIndex<ImageType>;
-    IteratorType it(m_FixedImage, m_FixedImage->GetLargestPossibleRegion());
     
+    // 计算固定图像的最小最大值
+    IteratorType it(m_FixedImage, m_FixedImage->GetLargestPossibleRegion());
     it.GoToBegin();
     m_FixedImageMin = it.Get();
     m_FixedImageMax = it.Get();
@@ -91,7 +137,6 @@ void MattesMutualInformation::ComputeImageExtrema()
 
     // 计算移动图像的最小最大值
     IteratorType it2(m_MovingImage, m_MovingImage->GetLargestPossibleRegion());
-    
     it2.GoToBegin();
     m_MovingImageMin = it2.Get();
     m_MovingImageMax = it2.Get();
@@ -103,15 +148,177 @@ void MattesMutualInformation::ComputeImageExtrema()
         if (value > m_MovingImageMax) m_MovingImageMax = value;
         ++it2;
     }
+    
+    // 稍微扩展范围避免边界问题
+    double fixedRange = m_FixedImageMax - m_FixedImageMin;
+    double movingRange = m_MovingImageMax - m_MovingImageMin;
+    m_FixedImageMin -= fixedRange * 0.001;
+    m_FixedImageMax += fixedRange * 0.001;
+    m_MovingImageMin -= movingRange * 0.001;
+    m_MovingImageMax += movingRange * 0.001;
 }
+
+// ============================================================================
+// 计算移动图像梯度 (用于解析梯度)
+// ============================================================================
+
+void MattesMutualInformation::ComputeMovingImageGradient()
+{
+    // 使用ITK的GradientImageFilter计算图像梯度
+    using GradientFilterType = itk::GradientImageFilter<ImageType, float, float>;
+    using GradientOutputType = GradientFilterType::OutputImageType;
+    
+    auto gradientFilter = GradientFilterType::New();
+    gradientFilter->SetInput(m_MovingImage);
+    gradientFilter->SetUseImageSpacing(true);  // 考虑物理spacing
+    gradientFilter->Update();
+    
+    GradientOutputType::Pointer gradientImage = gradientFilter->GetOutput();
+    
+    // 将梯度向量图像分解为3个标量图像(便于插值)
+    ImageType::RegionType region = m_MovingImage->GetLargestPossibleRegion();
+    
+    for (int dim = 0; dim < 3; ++dim)
+    {
+        m_MovingImageGradient[dim] = ImageType::New();
+        m_MovingImageGradient[dim]->SetRegions(region);
+        m_MovingImageGradient[dim]->SetSpacing(m_MovingImage->GetSpacing());
+        m_MovingImageGradient[dim]->SetOrigin(m_MovingImage->GetOrigin());
+        m_MovingImageGradient[dim]->SetDirection(m_MovingImage->GetDirection());
+        m_MovingImageGradient[dim]->Allocate();
+    }
+    
+    // 复制梯度分量
+    using GradientIteratorType = itk::ImageRegionConstIteratorWithIndex<GradientOutputType>;
+    GradientIteratorType gradIt(gradientImage, region);
+    
+    for (gradIt.GoToBegin(); !gradIt.IsAtEnd(); ++gradIt)
+    {
+        auto index = gradIt.GetIndex();
+        auto gradientVector = gradIt.Get();
+        
+        for (int dim = 0; dim < 3; ++dim)
+        {
+            m_MovingImageGradient[dim]->SetPixel(index, gradientVector[dim]);
+        }
+    }
+    
+    // 设置梯度插值器
+    for (int dim = 0; dim < 3; ++dim)
+    {
+        m_GradientInterpolators[dim]->SetInputImage(m_MovingImageGradient[dim]);
+    }
+}
+
+// ============================================================================
+// 采样策略
+// ============================================================================
 
 void MattesMutualInformation::SampleFixedImage()
 {
-    // 随机采样固定图像
+    if (m_UseStratifiedSampling)
+    {
+        SampleFixedImageStratified();
+    }
+    else
+    {
+        SampleFixedImageRandom();
+    }
+}
+
+void MattesMutualInformation::SampleFixedImageStratified()
+{
+    // 分层均匀采样: 将图像划分为网格,在每个格子中随机采样
+    // 这确保采样点在空间上均匀分布
+    
+    ImageType::RegionType region = m_FixedImage->GetLargestPossibleRegion();
+    ImageType::SizeType size = region.GetSize();
+    
+    // 计算网格划分
+    // 目标: 采样数 ≈ gridX * gridY * gridZ * samplesPerCell
+    double totalVoxels = static_cast<double>(size[0] * size[1] * size[2]);
+    double samplingRatio = static_cast<double>(m_NumberOfSpatialSamples) / totalVoxels;
+    
+    // 每个维度的网格数 (立方根近似)
+    unsigned int gridDivisions = static_cast<unsigned int>(
+        std::cbrt(static_cast<double>(m_NumberOfSpatialSamples) / 8.0));
+    gridDivisions = std::max(gridDivisions, 2u);
+    gridDivisions = std::min(gridDivisions, 50u);
+    
+    unsigned int gridX = std::min(gridDivisions, static_cast<unsigned int>(size[0]));
+    unsigned int gridY = std::min(gridDivisions, static_cast<unsigned int>(size[1]));
+    unsigned int gridZ = std::min(gridDivisions, static_cast<unsigned int>(size[2]));
+    
+    // 每个格子的采样数
+    unsigned int totalCells = gridX * gridY * gridZ;
+    unsigned int samplesPerCell = std::max(1u, m_NumberOfSpatialSamples / totalCells);
+    
+    // 每个格子的尺寸
+    unsigned int cellSizeX = size[0] / gridX;
+    unsigned int cellSizeY = size[1] / gridY;
+    unsigned int cellSizeZ = size[2] / gridZ;
+    
+    m_SamplePoints.clear();
+    m_SamplePoints.reserve(m_NumberOfSpatialSamples);
+    
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    
+    for (unsigned int gz = 0; gz < gridZ; ++gz)
+    {
+        for (unsigned int gy = 0; gy < gridY; ++gy)
+        {
+            for (unsigned int gx = 0; gx < gridX; ++gx)
+            {
+                // 当前格子的起始索引
+                unsigned int startX = gx * cellSizeX;
+                unsigned int startY = gy * cellSizeY;
+                unsigned int startZ = gz * cellSizeZ;
+                
+                // 当前格子的结束索引
+                unsigned int endX = (gx == gridX - 1) ? size[0] : (gx + 1) * cellSizeX;
+                unsigned int endY = (gy == gridY - 1) ? size[1] : (gy + 1) * cellSizeY;
+                unsigned int endZ = (gz == gridZ - 1) ? size[2] : (gz + 1) * cellSizeZ;
+                
+                // 在格子内随机采样
+                for (unsigned int s = 0; s < samplesPerCell; ++s)
+                {
+                    if (m_SamplePoints.size() >= m_NumberOfSpatialSamples)
+                        break;
+                    
+                    // 随机索引
+                    ImageType::IndexType index;
+                    index[0] = startX + static_cast<unsigned int>(dist(m_RandomGenerator) * (endX - startX));
+                    index[1] = startY + static_cast<unsigned int>(dist(m_RandomGenerator) * (endY - startY));
+                    index[2] = startZ + static_cast<unsigned int>(dist(m_RandomGenerator) * (endZ - startZ));
+                    
+                    // 边界检查
+                    index[0] = std::min(index[0], static_cast<ImageType::IndexType::IndexValueType>(size[0] - 1));
+                    index[1] = std::min(index[1], static_cast<ImageType::IndexType::IndexValueType>(size[1] - 1));
+                    index[2] = std::min(index[2], static_cast<ImageType::IndexType::IndexValueType>(size[2] - 1));
+                    
+                    SamplePoint sample;
+                    m_FixedImage->TransformIndexToPhysicalPoint(index, sample.fixedPoint);
+                    sample.fixedValue = m_FixedImage->GetPixel(index);
+                    
+                    // 预计算固定图像B样条权重
+                    double fixedContinuousIndex = ComputeFixedImageContinuousIndex(sample.fixedValue);
+                    ComputeBSplineWeights(fixedContinuousIndex, 
+                                         sample.fixedParzenWindowIndex,
+                                         sample.fixedBSplineWeights);
+                    
+                    m_SamplePoints.push_back(sample);
+                }
+            }
+        }
+    }
+}
+
+void MattesMutualInformation::SampleFixedImageRandom()
+{
+    // 原始随机采样方法(作为备选)
     using IteratorType = itk::ImageRegionConstIteratorWithIndex<ImageType>;
     ImageType::RegionType region = m_FixedImage->GetLargestPossibleRegion();
     
-    // 收集所有有效点的索引
     std::vector<ImageType::IndexType> allIndices;
     IteratorType it(m_FixedImage, region);
     
@@ -120,7 +327,6 @@ void MattesMutualInformation::SampleFixedImage()
         allIndices.push_back(it.GetIndex());
     }
 
-    // 使用固定种子随机打乱
     std::shuffle(allIndices.begin(), allIndices.end(), m_RandomGenerator);
 
     unsigned int numSamples = std::min(m_NumberOfSpatialSamples, 
@@ -132,13 +338,177 @@ void MattesMutualInformation::SampleFixedImage()
     for (unsigned int i = 0; i < numSamples; ++i)
     {
         SamplePoint sample;
-        m_FixedImage->TransformIndexToPhysicalPoint(allIndices[i], sample.point);
+        m_FixedImage->TransformIndexToPhysicalPoint(allIndices[i], sample.fixedPoint);
         sample.fixedValue = m_FixedImage->GetPixel(allIndices[i]);
+        
+        // 预计算固定图像B样条权重
+        double fixedContinuousIndex = ComputeFixedImageContinuousIndex(sample.fixedValue);
+        ComputeBSplineWeights(fixedContinuousIndex, 
+                             sample.fixedParzenWindowIndex,
+                             sample.fixedBSplineWeights);
+        
         m_SamplePoints.push_back(sample);
     }
 }
 
-void MattesMutualInformation::ComputeJointPDF()
+// ============================================================================
+// B样条计算
+// ============================================================================
+
+double MattesMutualInformation::EvaluateCubicBSpline(double u) const
+{
+    // 三次B样条基函数 (ITK使用的标准形式)
+    // 定义在 [-2, 2] 区间
+    double absU = std::abs(u);
+    
+    if (absU < 1.0)
+    {
+        // |u| < 1: (4 - 6u^2 + 3|u|^3) / 6
+        return (4.0 - 6.0 * absU * absU + 3.0 * absU * absU * absU) / 6.0;
+    }
+    else if (absU < 2.0)
+    {
+        // 1 <= |u| < 2: (2 - |u|)^3 / 6
+        double tmp = 2.0 - absU;
+        return (tmp * tmp * tmp) / 6.0;
+    }
+    else
+    {
+        return 0.0;
+    }
+}
+
+double MattesMutualInformation::EvaluateCubicBSplineDerivative(double u) const
+{
+    // 三次B样条的导数
+    double absU = std::abs(u);
+    double sign = (u >= 0) ? 1.0 : -1.0;
+    
+    if (absU < 1.0)
+    {
+        // d/du [(4 - 6u^2 + 3|u|^3) / 6] = (-12u + 9u|u|) / 6 = u(-2 + 1.5|u|)
+        return sign * (-2.0 * absU + 1.5 * absU * absU);
+    }
+    else if (absU < 2.0)
+    {
+        // d/du [(2 - |u|)^3 / 6] = -sign * (2 - |u|)^2 / 2
+        double tmp = 2.0 - absU;
+        return -sign * (tmp * tmp) / 2.0;
+    }
+    else
+    {
+        return 0.0;
+    }
+}
+
+void MattesMutualInformation::ComputeBSplineWeights(
+    double continuousIndex, 
+    int& startIndex, 
+    std::array<double, 4>& weights) const
+{
+    // 计算B样条的起始索引和4个权重
+    // B样条在 [startIndex-1, startIndex+2] 范围内有值
+    
+    startIndex = static_cast<int>(std::floor(continuousIndex)) - 1;
+    
+    for (int i = 0; i < 4; ++i)
+    {
+        double u = continuousIndex - (startIndex + i);
+        weights[i] = EvaluateCubicBSpline(u);
+    }
+}
+
+void MattesMutualInformation::ComputeBSplineDerivativeWeights(
+    double continuousIndex, 
+    int& startIndex, 
+    std::array<double, 4>& derivativeWeights) const
+{
+    startIndex = static_cast<int>(std::floor(continuousIndex)) - 1;
+    
+    for (int i = 0; i < 4; ++i)
+    {
+        double u = continuousIndex - (startIndex + i);
+        derivativeWeights[i] = EvaluateCubicBSplineDerivative(u);
+    }
+}
+
+// ============================================================================
+// 强度到连续索引转换
+// ============================================================================
+
+double MattesMutualInformation::ComputeFixedImageContinuousIndex(double value) const
+{
+    // 将图像强度值转换为直方图的连续索引
+    // 留出2个bin的padding
+    const double padding = 2.0;
+    return padding + (value - m_FixedImageMin) / m_FixedImageBinSize;
+}
+
+double MattesMutualInformation::ComputeMovingImageContinuousIndex(double value) const
+{
+    const double padding = 2.0;
+    return padding + (value - m_MovingImageMin) / m_MovingImageBinSize;
+}
+
+// ============================================================================
+// 计算变换的雅可比矩阵
+// ============================================================================
+
+void MattesMutualInformation::ComputeTransformJacobian(
+    const ImageType::PointType& point,
+    std::vector<std::array<double, 3>>& jacobian)
+{
+    // Euler3DTransform的雅可比矩阵
+    // 参数: [rotX, rotY, rotZ, transX, transY, transZ]
+    // 输出点 = R * (输入点 - center) + center + translation
+    
+    // 获取变换参数
+    auto params = m_Transform->GetParameters();
+    auto center = m_Transform->GetCenter();
+    
+    double rx = params[0];  // rotation around X
+    double ry = params[1];  // rotation around Y
+    double rz = params[2];  // rotation around Z
+    
+    // 计算相对于中心的点
+    double px = point[0] - center[0];
+    double py = point[1] - center[1];
+    double pz = point[2] - center[2];
+    
+    // 预计算三角函数
+    double cx = std::cos(rx), sx = std::sin(rx);
+    double cy = std::cos(ry), sy = std::sin(ry);
+    double cz = std::cos(rz), sz = std::sin(rz);
+    
+    jacobian.resize(6);
+    
+    // 对 rotX 的导数
+    // dR/d(rx) * (p - center)
+    jacobian[0][0] = 0.0;
+    jacobian[0][1] = (-sx*sy*cz - cx*sz) * px + (-sx*sy*sz + cx*cz) * py + (-sx*cy) * pz;
+    jacobian[0][2] = (cx*sy*cz - sx*sz) * px + (cx*sy*sz + sx*cz) * py + (cx*cy) * pz;
+    
+    // 对 rotY 的导数
+    jacobian[1][0] = (-sy*cz) * px + (-sy*sz) * py + (-cy) * pz;
+    jacobian[1][1] = (cx*cy*cz) * px + (cx*cy*sz) * py + (-cx*sy) * pz;
+    jacobian[1][2] = (sx*cy*cz) * px + (sx*cy*sz) * py + (-sx*sy) * pz;
+    
+    // 对 rotZ 的导数
+    jacobian[2][0] = (-cy*sz) * px + (cy*cz) * py;
+    jacobian[2][1] = (-sx*sy*sz - cx*cz) * px + (sx*sy*cz - cx*sz) * py;
+    jacobian[2][2] = (cx*sy*sz - sx*cz) * px + (-cx*sy*cz - sx*sz) * py;
+    
+    // 对平移的导数 (单位矩阵)
+    jacobian[3] = {1.0, 0.0, 0.0};
+    jacobian[4] = {0.0, 1.0, 0.0};
+    jacobian[5] = {0.0, 0.0, 1.0};
+}
+
+// ============================================================================
+// 核心计算: 联合PDF和导数
+// ============================================================================
+
+void MattesMutualInformation::ComputeJointPDFAndDerivatives()
 {
     if (!m_Transform)
     {
@@ -152,14 +522,24 @@ void MattesMutualInformation::ComputeJointPDF()
     }
     std::fill(m_FixedImageMarginalPDF.begin(), m_FixedImageMarginalPDF.end(), 0.0);
     std::fill(m_MovingImageMarginalPDF.begin(), m_MovingImageMarginalPDF.end(), 0.0);
+    
+    // 清空梯度PDF
+    for (auto& paramDerivative : m_JointPDFDerivatives)
+    {
+        for (auto& row : paramDerivative)
+        {
+            std::fill(row.begin(), row.end(), 0.0);
+        }
+    }
 
-    unsigned int validSamples = 0;
+    m_NumberOfValidSamples = 0;
+    std::vector<std::array<double, 3>> jacobian;
 
     // 遍历所有采样点
     for (const auto& sample : m_SamplePoints)
     {
         // 使用变换将固定图像点变换到移动图像空间
-        ImageType::PointType transformedPoint = m_Transform->TransformPoint(sample.point);
+        ImageType::PointType transformedPoint = m_Transform->TransformPoint(sample.fixedPoint);
 
         // 检查变换后的点是否在移动图像范围内
         if (!m_Interpolator->IsInsideBuffer(transformedPoint))
@@ -169,40 +549,111 @@ void MattesMutualInformation::ComputeJointPDF()
 
         // 插值获取移动图像值
         double movingValue = m_Interpolator->Evaluate(transformedPoint);
-
-        // 计算直方图bin索引
-        int fixedBin = ComputeFixedImageBin(sample.fixedValue);
-        int movingBin = ComputeMovingImageBin(movingValue);
-
-        if (fixedBin >= 0 && fixedBin < static_cast<int>(m_NumberOfHistogramBins) &&
-            movingBin >= 0 && movingBin < static_cast<int>(m_NumberOfHistogramBins))
+        
+        // 计算移动图像的连续索引和B样条权重
+        double movingContinuousIndex = ComputeMovingImageContinuousIndex(movingValue);
+        int movingStartIndex;
+        std::array<double, 4> movingBSplineWeights;
+        ComputeBSplineWeights(movingContinuousIndex, movingStartIndex, movingBSplineWeights);
+        
+        // 计算移动图像B样条导数权重
+        std::array<double, 4> movingBSplineDerivativeWeights;
+        int tempStartIndex;
+        ComputeBSplineDerivativeWeights(movingContinuousIndex, tempStartIndex, movingBSplineDerivativeWeights);
+        
+        // 获取移动图像梯度
+        std::array<double, 3> movingGradient = {0.0, 0.0, 0.0};
+        for (int dim = 0; dim < 3; ++dim)
         {
-            m_JointPDF[fixedBin][movingBin] += 1.0;
-            validSamples++;
+            if (m_GradientInterpolators[dim]->IsInsideBuffer(transformedPoint))
+            {
+                movingGradient[dim] = m_GradientInterpolators[dim]->Evaluate(transformedPoint);
+            }
         }
+        
+        // 计算变换雅可比矩阵
+        ComputeTransformJacobian(sample.fixedPoint, jacobian);
+        
+        // 计算 dm/dp = gradient_M^T * dT/dp
+        // dm/dp[k] = sum_d (gradient_M[d] * jacobian[k][d])
+        std::array<double, 6> dmDp;
+        for (int k = 0; k < 6; ++k)
+        {
+            dmDp[k] = 0.0;
+            for (int d = 0; d < 3; ++d)
+            {
+                dmDp[k] += movingGradient[d] * jacobian[k][d];
+            }
+            // 转换为bin索引的导数
+            dmDp[k] /= m_MovingImageBinSize;
+        }
+
+        // 累加到联合PDF和导数PDF
+        for (int fi = 0; fi < 4; ++fi)
+        {
+            int fixedBin = sample.fixedParzenWindowIndex + fi;
+            if (fixedBin < 0 || fixedBin >= static_cast<int>(m_NumberOfHistogramBins))
+                continue;
+                
+            double fixedWeight = sample.fixedBSplineWeights[fi];
+            
+            for (int mi = 0; mi < 4; ++mi)
+            {
+                int movingBin = movingStartIndex + mi;
+                if (movingBin < 0 || movingBin >= static_cast<int>(m_NumberOfHistogramBins))
+                    continue;
+                
+                double movingWeight = movingBSplineWeights[mi];
+                double movingDerivWeight = movingBSplineDerivativeWeights[mi];
+                
+                // 联合PDF贡献
+                double jointContribution = fixedWeight * movingWeight;
+                m_JointPDF[fixedBin][movingBin] += jointContribution;
+                
+                // 导数PDF贡献
+                // dP/dp = B_fixed * dB_moving/dm * dm/dp
+                for (int k = 0; k < 6; ++k)
+                {
+                    double derivContribution = fixedWeight * movingDerivWeight * dmDp[k];
+                    m_JointPDFDerivatives[k][fixedBin][movingBin] += derivContribution;
+                }
+            }
+        }
+        
+        m_NumberOfValidSamples++;
     }
 
     // 归一化为概率分布
-    if (validSamples > 0)
+    if (m_NumberOfValidSamples > 0)
     {
-        double normalizationFactor = 1.0 / validSamples;
+        double normFactor = 1.0 / static_cast<double>(m_NumberOfValidSamples);
         
         for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
         {
             for (unsigned int j = 0; j < m_NumberOfHistogramBins; ++j)
             {
-                m_JointPDF[i][j] *= normalizationFactor;
+                m_JointPDF[i][j] *= normFactor;
                 m_FixedImageMarginalPDF[i] += m_JointPDF[i][j];
                 m_MovingImageMarginalPDF[j] += m_JointPDF[i][j];
+                
+                // 归一化导数
+                for (int k = 0; k < 6; ++k)
+                {
+                    m_JointPDFDerivatives[k][i][j] *= normFactor;
+                }
             }
         }
     }
 }
 
+// ============================================================================
+// 计算互信息值
+// ============================================================================
+
 double MattesMutualInformation::ComputeMutualInformation()
 {
     double mutualInformation = 0.0;
-    const double epsilon = 1e-12; // 避免log(0)
+    const double epsilon = 1e-16;
 
     for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
     {
@@ -219,7 +670,7 @@ double MattesMutualInformation::ComputeMutualInformation()
             if (jointProb < epsilon || movingProb < epsilon)
                 continue;
 
-            // MI = sum( P(i,j) * log( P(i,j) / (P(i) * P(j)) ) )
+            // MI = sum( P(f,m) * log( P(f,m) / (P(f) * P(m)) ) )
             mutualInformation += jointProb * std::log(jointProb / (fixedProb * movingProb));
         }
     }
@@ -227,90 +678,74 @@ double MattesMutualInformation::ComputeMutualInformation()
     return mutualInformation;
 }
 
+// ============================================================================
+// 计算解析梯度
+// ============================================================================
+
+void MattesMutualInformation::ComputeAnalyticalGradient(ParametersType& derivative)
+{
+    // 解析梯度公式:
+    // dMI/dp = sum_f sum_m [ dP(f,m)/dp * (1 + log(P(f,m) / P(m))) ]
+    //        = sum_f sum_m [ dP(f,m)/dp * log(P(f,m) / P(m)) ]
+    //          + sum_f sum_m [ dP(f,m)/dp ]
+    // 
+    // 第二项 = d(sum P)/dp = 0 (因为概率和为1)
+    // 所以:
+    // dMI/dp = sum_f sum_m [ dP(f,m)/dp * log(P(f,m) / P(m)) ]
+    
+    const double epsilon = 1e-16;
+    derivative.resize(6, 0.0);
+    
+    for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
+    {
+        for (unsigned int j = 0; j < m_NumberOfHistogramBins; ++j)
+        {
+            double jointProb = m_JointPDF[i][j];
+            double movingProb = m_MovingImageMarginalPDF[j];
+            
+            if (jointProb < epsilon || movingProb < epsilon)
+                continue;
+            
+            // log(P(f,m) / P(m))
+            double logTerm = std::log(jointProb / movingProb);
+            
+            for (int k = 0; k < 6; ++k)
+            {
+                derivative[k] += m_JointPDFDerivatives[k][i][j] * logTerm;
+            }
+        }
+    }
+    
+    // 因为我们最小化负互信息,所以梯度取负
+    for (int k = 0; k < 6; ++k)
+    {
+        derivative[k] = -derivative[k];
+    }
+}
+
+// ============================================================================
+// 公共接口
+// ============================================================================
+
 double MattesMutualInformation::GetValue()
 {
-    ComputeJointPDF();
+    ComputeJointPDFAndDerivatives();
     double mi = ComputeMutualInformation();
-    m_CurrentValue = -mi; // 返回负值,因为我们要最小化
+    m_CurrentValue = -mi;  // 返回负值,因为我们要最小化
     return m_CurrentValue;
 }
 
 void MattesMutualInformation::GetDerivative(ParametersType& derivative)
 {
-    // 使用有限差分法计算梯度
-    // 对于Euler3DTransform: 参数0-2是旋转(rad), 参数3-5是平移(mm)
-    const unsigned int numParams = 6;
-    derivative.resize(numParams);
-    
-    // 不同参数类型使用不同的扰动量
-    // 旋转参数用小扰动(弧度), 平移参数用较大扰动(毫米)
-    const double rotationDelta = 1e-4;    // ~0.006 degrees
-    const double translationDelta = 0.01;  // 0.01 mm
-
-    // 保存当前变换参数
-    auto currentParams = m_Transform->GetParameters();
-    
-    // 使用中心差分法,更准确
-    for (unsigned int i = 0; i < numParams; ++i)
-    {
-        double delta = (i < 3) ? rotationDelta : translationDelta;
-        
-        // 正向扰动
-        auto forwardParams = currentParams;
-        forwardParams[i] += delta;
-        m_Transform->SetParameters(forwardParams);
-        double forwardValue = GetValue();
-        
-        // 负向扰动
-        auto backwardParams = currentParams;
-        backwardParams[i] -= delta;
-        m_Transform->SetParameters(backwardParams);
-        double backwardValue = GetValue();
-        
-        // 中心差分
-        derivative[i] = (forwardValue - backwardValue) / (2.0 * delta);
-    }
-
-    // 恢复原始参数
-    m_Transform->SetParameters(currentParams);
-    // 重新计算当前值
-    m_CurrentValue = GetValue();
+    // 先计算PDF(如果还没计算的话)
+    ComputeJointPDFAndDerivatives();
+    ComputeAnalyticalGradient(derivative);
 }
 
 void MattesMutualInformation::GetValueAndDerivative(double& value, ParametersType& derivative)
 {
-    value = GetValue();
-    GetDerivative(derivative);
-}
-
-int MattesMutualInformation::ComputeFixedImageBin(double value) const
-{
-    if (m_FixedImageMax <= m_FixedImageMin)
-        return 0;
-        
-    if (value <= m_FixedImageMin)
-        return 0;
-    if (value >= m_FixedImageMax)
-        return m_NumberOfHistogramBins - 1;
-
-    double range = m_FixedImageMax - m_FixedImageMin;
-    int bin = static_cast<int>((value - m_FixedImageMin) / range * m_NumberOfHistogramBins);
-    
-    return std::min(bin, static_cast<int>(m_NumberOfHistogramBins - 1));
-}
-
-int MattesMutualInformation::ComputeMovingImageBin(double value) const
-{
-    if (m_MovingImageMax <= m_MovingImageMin)
-        return 0;
-        
-    if (value <= m_MovingImageMin)
-        return 0;
-    if (value >= m_MovingImageMax)
-        return m_NumberOfHistogramBins - 1;
-
-    double range = m_MovingImageMax - m_MovingImageMin;
-    int bin = static_cast<int>((value - m_MovingImageMin) / range * m_NumberOfHistogramBins);
-    
-    return std::min(bin, static_cast<int>(m_NumberOfHistogramBins - 1));
+    ComputeJointPDFAndDerivatives();
+    value = -ComputeMutualInformation();
+    m_CurrentValue = value;
+    ComputeAnalyticalGradient(derivative);
 }

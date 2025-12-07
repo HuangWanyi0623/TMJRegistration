@@ -160,6 +160,7 @@ void ImageRegistration::RunSingleLevel(ImageType::Pointer fixedImage, ImageType:
     m_Metric->SetNumberOfSpatialSamples(m_NumberOfSpatialSamples);
     m_Metric->SetRandomSeed(m_RandomSeed);
     m_Metric->SetTransform(m_Transform);
+    m_Metric->SetUseStratifiedSampling(true);  // 使用分层采样
     m_Metric->Initialize();
 
     // 配置优化器
@@ -171,20 +172,8 @@ void ImageRegistration::RunSingleLevel(ImageType::Pointer fixedImage, ImageType:
     m_Optimizer->SetReturnBestParametersAndValue(true);
     m_Optimizer->SetNumberOfParameters(6);
     
-    // 设置参数尺度 - 关键！
-    // 旋转参数(rad)需要更大的尺度来限制更新幅度
-    // 平移参数(mm)需要较小的尺度
-    // ITK典型值: 旋转尺度 = 1.0, 平移尺度 = 1/translation_scale
-    // 对于医学图像, translation_scale 通常是 1000 (让平移参数更新更大)
-    std::vector<double> scales(6);
-    const double rotationScale = 1.0;
-    const double translationScale = 1.0 / 1000.0;  // 让平移更新更激进
-    scales[0] = rotationScale;  // rotation X
-    scales[1] = rotationScale;  // rotation Y
-    scales[2] = rotationScale;  // rotation Z
-    scales[3] = translationScale;  // translation X
-    scales[4] = translationScale;  // translation Y
-    scales[5] = translationScale;  // translation Z
+    // 使用自动估算的参数尺度
+    std::vector<double> scales = EstimateParameterScales();
     m_Optimizer->SetScales(scales);
 
     // 设置代价函数
@@ -316,4 +305,70 @@ void ImageRegistration::Update()
 
     std::cout << "Final metric value: " << std::scientific << std::setprecision(4) 
               << m_FinalMetricValue << std::endl;
+}
+
+// ============================================================================
+// 计算图像的物理半径 (用于参数尺度估算)
+// ============================================================================
+
+double ImageRegistration::ComputePhysicalRadius(ImageType::Pointer image)
+{
+    // 计算图像对角线长度的一半作为"物理半径"
+    auto region = image->GetLargestPossibleRegion();
+    auto size = region.GetSize();
+    auto spacing = image->GetSpacing();
+    
+    double diagonalSquared = 0.0;
+    for (unsigned int dim = 0; dim < 3; ++dim)
+    {
+        double physicalLength = size[dim] * spacing[dim];
+        diagonalSquared += physicalLength * physicalLength;
+    }
+    
+    return std::sqrt(diagonalSquared) / 2.0;
+}
+
+// ============================================================================
+// 自动估算参数尺度 (类似ITK的RegistrationParameterScalesFromPhysicalShift)
+// ============================================================================
+
+std::vector<double> ImageRegistration::EstimateParameterScales()
+{
+    // ITK的RegistrationParameterScalesFromPhysicalShift原理:
+    // 对于每个参数,估算单位参数变化导致的物理空间平均位移
+    // scales[i] = 1.0 / average_physical_shift[i]
+    // 这样让所有参数在优化时有相似的"步幅"
+    
+    std::vector<double> scales(6);
+    
+    // 计算图像的物理半径 (用于估算旋转的影响)
+    double physicalRadius = ComputePhysicalRadius(m_FixedImage);
+    
+    // 旋转参数的尺度估算:
+    // 旋转1弧度在半径R处产生的位移约为R
+    // 所以 scale_rotation = 1.0 / R
+    // 这使得旋转参数的"有效步长"与平移参数可比
+    double rotationScale = 1.0 / physicalRadius;
+    
+    // 平移参数的尺度:
+    // 平移1mm产生的位移就是1mm
+    // scale_translation = 1.0 / 1.0 = 1.0
+    double translationScale = 1.0;
+    
+    scales[0] = rotationScale;  // rotation X
+    scales[1] = rotationScale;  // rotation Y
+    scales[2] = rotationScale;  // rotation Z
+    scales[3] = translationScale;  // translation X
+    scales[4] = translationScale;  // translation Y
+    scales[5] = translationScale;  // translation Z
+    
+    std::cout << "Parameter Scales (auto-estimated):" << std::endl;
+    std::cout << "  Physical radius: " << std::fixed << std::setprecision(2) 
+              << physicalRadius << " mm" << std::endl;
+    std::cout << "  Rotation scale: " << std::scientific << std::setprecision(4) 
+              << rotationScale << std::endl;
+    std::cout << "  Translation scale: " << std::fixed << std::setprecision(4) 
+              << translationScale << std::endl;
+    
+    return scales;
 }
