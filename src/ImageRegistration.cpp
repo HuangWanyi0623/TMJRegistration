@@ -358,22 +358,72 @@ void ImageRegistration::InitializeAffineTransform()
     ComputeGeometricCenter(m_FixedImage, fixedCenter);
     ComputeGeometricCenter(m_MovingImage, movingCenter);
 
-    m_AffineTransform->SetCenter(fixedCenter);
-    
-    // 初始化为单位矩阵
-    AffineTransformType::MatrixType matrix;
-    matrix.SetIdentity();
-    m_AffineTransform->SetMatrix(matrix);
-    
-    // 设置初始平移
-    AffineTransformType::OutputVectorType initialTranslation;
-    initialTranslation[0] = movingCenter[0] - fixedCenter[0];
-    initialTranslation[1] = movingCenter[1] - fixedCenter[1];
-    initialTranslation[2] = movingCenter[2] - fixedCenter[2];
-    m_AffineTransform->SetTranslation(initialTranslation);
+    // 如果有初始变换(例如刚体配准结果),从中初始化仿射变换
+    if (m_UseInitialTransform && m_InitialTransform->GetNumberOfTransforms() > 0)
+    {
+        std::cout << "[Initial Transform] Initializing Affine from loaded transform..." << std::endl;
+        
+        auto firstTransform = m_InitialTransform->GetNthTransform(0);
+        
+        if (auto rigidInit = dynamic_cast<RigidTransformType*>(firstTransform.GetPointer()))
+        {
+            // 从刚体变换初始化:保留中心、矩阵和平移
+            m_AffineTransform->SetCenter(rigidInit->GetCenter());
+            m_AffineTransform->SetMatrix(rigidInit->GetMatrix());
+            m_AffineTransform->SetTranslation(rigidInit->GetTranslation());
+            
+            std::cout << "  Initialized from Rigid transform" << std::endl;
+            auto center = rigidInit->GetCenter();
+            auto params = rigidInit->GetParameters();
+            std::cout << "    Center: [" << center[0] << ", " << center[1] << ", " << center[2] << "]" << std::endl;
+            std::cout << "    Rotation (rad): [" << params[0] << ", " << params[1] << ", " << params[2] << "]" << std::endl;
+            std::cout << "    Translation (mm): [" << params[3] << ", " << params[4] << ", " << params[5] << "]" << std::endl;
+        }
+        else if (auto affineInit = dynamic_cast<AffineTransformType*>(firstTransform.GetPointer()))
+        {
+            // 从仿射变换初始化:直接复制
+            m_AffineTransform->SetCenter(affineInit->GetCenter());
+            m_AffineTransform->SetMatrix(affineInit->GetMatrix());
+            m_AffineTransform->SetTranslation(affineInit->GetTranslation());
+            
+            std::cout << "  Initialized from Affine transform" << std::endl;
+            auto center = affineInit->GetCenter();
+            std::cout << "    Center: [" << center[0] << ", " << center[1] << ", " << center[2] << "]" << std::endl;
+        }
+        else
+        {
+            std::cout << "  [Warning] Initial transform type not recognized, using default initialization" << std::endl;
+            // 回退到默认初始化
+            m_AffineTransform->SetCenter(fixedCenter);
+            AffineTransformType::MatrixType matrix;
+            matrix.SetIdentity();
+            m_AffineTransform->SetMatrix(matrix);
+            
+            AffineTransformType::OutputVectorType initialTranslation;
+            initialTranslation[0] = movingCenter[0] - fixedCenter[0];
+            initialTranslation[1] = movingCenter[1] - fixedCenter[1];
+            initialTranslation[2] = movingCenter[2] - fixedCenter[2];
+            m_AffineTransform->SetTranslation(initialTranslation);
+        }
+    }
+    else
+    {
+        // 没有初始变换,使用默认初始化
+        m_AffineTransform->SetCenter(fixedCenter);
+        
+        AffineTransformType::MatrixType matrix;
+        matrix.SetIdentity();
+        m_AffineTransform->SetMatrix(matrix);
+        
+        AffineTransformType::OutputVectorType initialTranslation;
+        initialTranslation[0] = movingCenter[0] - fixedCenter[0];
+        initialTranslation[1] = movingCenter[1] - fixedCenter[1];
+        initialTranslation[2] = movingCenter[2] - fixedCenter[2];
+        m_AffineTransform->SetTranslation(initialTranslation);
 
-    std::cout << "Initial affine transform center: [" 
-              << fixedCenter[0] << ", " << fixedCenter[1] << ", " << fixedCenter[2] << "]" << std::endl;
+        std::cout << "Initial affine transform center: [" 
+                  << fixedCenter[0] << ", " << fixedCenter[1] << ", " << fixedCenter[2] << "]" << std::endl;
+    }
 }
 
 // ============================================================================
@@ -788,57 +838,18 @@ void ImageRegistration::RunSingleLevelAffine(ImageType::Pointer fixedImage, Imag
         m_Metric->SetNumberOfSpatialSamples(m_NumberOfSpatialSamples);
     }
     m_Metric->SetRandomSeed(m_RandomSeed);
-    // 使用复合变换（初始变换 + 当前仿射）用于度量
-    auto metricTransform = CompositeTransformType::New();
-    if (m_UseInitialTransform && m_InitialTransform->GetNumberOfTransforms() > 0)
-    {
-        for (unsigned int i = 0; i < m_InitialTransform->GetNumberOfTransforms(); ++i)
-        {
-            metricTransform->AddTransform(m_InitialTransform->GetNthTransform(i));
-        }
-    }
-    metricTransform->AddTransform(m_AffineTransform);
-    m_Metric->SetTransform(metricTransform);
+    
+    // 关键:直接使用已初始化的m_AffineTransform,不使用CompositeTransform
+    // 与刚体配准采用相同的策略
+    m_Metric->SetTransform(m_AffineTransform);
     m_Metric->SetNumberOfParameters(12);
     m_Metric->SetUseStratifiedSampling(m_UseStratifiedSampling);
     
-    // 计算初始线性矩阵(如果有)用于链式雅可比
-    AffineTransformType::MatrixType initLinear;
-    initLinear.SetIdentity();
-    if (m_UseInitialTransform && m_InitialTransform->GetNumberOfTransforms() > 0)
-    {
-        AffineTransformType::MatrixType totalMatrix;
-        totalMatrix.SetIdentity();
-        for (unsigned int i = 0; i < m_InitialTransform->GetNumberOfTransforms(); ++i)
-        {
-            auto t = m_InitialTransform->GetNthTransform(i);
-            if (auto rt = dynamic_cast<RigidTransformType*>(t.GetPointer()))
-            {
-                totalMatrix = rt->GetMatrix() * totalMatrix;
-            }
-            else if (auto at = dynamic_cast<AffineTransformType*>(t.GetPointer()))
-            {
-                totalMatrix = at->GetMatrix() * totalMatrix;
-            }
-        }
-        initLinear = totalMatrix;
-    }
-
+    // 设置雅可比函数
     auto affineTransformPtr = m_AffineTransform;
-    m_Metric->SetJacobianFunction([affineTransformPtr, initLinear](const ImageType::PointType& point,
-                                                        std::vector<std::array<double, 3>>& jacobian) {
-        std::vector<std::array<double, 3>> jacCur;
-        ComputeAffineJacobian(point, affineTransformPtr, jacCur);
-        jacobian.resize(jacCur.size());
-        for (unsigned int k = 0; k < jacCur.size(); ++k)
-        {
-            std::array<double, 3> v = {0.0, 0.0, 0.0};
-            for (int r = 0; r < 3; ++r)
-            {
-                v[r] = initLinear(r,0) * jacCur[k][0] + initLinear(r,1) * jacCur[k][1] + initLinear(r,2) * jacCur[k][2];
-            }
-            jacobian[k] = v;
-        }
+    m_Metric->SetJacobianFunction([affineTransformPtr](const ImageType::PointType& point,
+                                                       std::vector<std::array<double, 3>>& jacobian) {
+        ComputeAffineJacobian(point, affineTransformPtr, jacobian);
     });
     
     m_Metric->Initialize();
@@ -854,6 +865,20 @@ void ImageRegistration::RunSingleLevelAffine(ImageType::Pointer fixedImage, Imag
     
     std::vector<double> scales = EstimateAffineParameterScales();
     m_Optimizer->SetScales(scales);
+    
+    // 为仿射变换设置合理的参数更新上限
+    // 矩阵元素:每次迭代最多变化0.1 (10%形变)
+    // 平移:每次迭代最多20mm
+    std::vector<double> maxUpdate(12);
+    for (int i = 0; i < 9; ++i)
+    {
+        maxUpdate[i] = 0.1;  // 矩阵元素
+    }
+    for (int i = 9; i < 12; ++i)
+    {
+        maxUpdate[i] = 20.0;  // 平移(mm)
+    }
+    m_Optimizer->SetMaxParameterUpdate(maxUpdate);
 
     m_Optimizer->SetCostFunction([this]() -> double {
         return m_Metric->GetValue();
@@ -890,6 +915,17 @@ void ImageRegistration::RunSingleLevelAffine(ImageType::Pointer fixedImage, Imag
         }
         m_AffineTransform->SetParameters(params);
     });
+
+    // 设置观察者
+    m_Optimizer->SetVerbose(m_Verbose);
+    if (m_Verbose)
+    {
+        m_Optimizer->SetObserverIterationInterval(1);
+    }
+    else
+    {
+        m_Optimizer->SetObserverIterationInterval(10);
+    }
 
     if (m_IterationObserver)
     {

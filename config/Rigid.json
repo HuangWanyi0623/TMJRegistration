@@ -1,17 +1,18 @@
 {
-    "_comment": "Registration Configuration File - Rigid Transform",
+    "_comment": "Registration Configuration File - Rigid Transform (6 DOF)",
+    "_description": "Optimized parameters based on successful testing",
     
     "transformType": "Rigid",
     
     "_section_metric": "=== Metric Parameters ===",
     "numberOfHistogramBins": 50,
-    "numberOfSpatialSamples": 100000,
+    "samplingPercentage": 0.1,
     
     "_section_optimizer": "=== Optimizer Parameters ===",
-    "learningRate": 0.5,
+    "learningRate": 0.1,
     "minimumStepLength": 1e-4,
     "numberOfIterations": 300,
-    "relaxationFactor": 0.8,
+    "relaxationFactor": 0.5,
     "gradientMagnitudeTolerance": 1e-4,
     
     "_section_multiresolution": "=== Multi-Resolution Parameters ===",
