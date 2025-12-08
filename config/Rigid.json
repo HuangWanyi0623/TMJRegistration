@@ -1,0 +1,25 @@
+{
+    "_comment": "Registration Configuration File - Rigid Transform",
+    
+    "transformType": "Rigid",
+    
+    "_section_metric": "=== Metric Parameters ===",
+    "numberOfHistogramBins": 50,
+    "numberOfSpatialSamples": 100000,
+    
+    "_section_optimizer": "=== Optimizer Parameters ===",
+    "learningRate": 0.5,
+    "minimumStepLength": 1e-4,
+    "numberOfIterations": 300,
+    "relaxationFactor": 0.8,
+    "gradientMagnitudeTolerance": 1e-4,
+    
+    "_section_multiresolution": "=== Multi-Resolution Parameters ===",
+    "numberOfLevels": 3,
+    "shrinkFactors": [4, 2, 1],
+    "smoothingSigmas": [2.0, 1.0, 0.0],
+    
+    "_section_sampling": "=== Sampling Parameters ===",
+    "useStratifiedSampling": true,
+    "randomSeed": 121212
+}

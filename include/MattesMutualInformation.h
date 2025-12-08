@@ -5,9 +5,10 @@
 #include <memory>
 #include <random>
 #include <array>
+#include <functional>
 #include "itkImage.h"
 #include "itkLinearInterpolateImageFunction.h"
-#include "itkEuler3DTransform.h"
+#include "itkTransform.h"
 
 /**
  * @brief Mattes互信息度量类 - 带解析梯度
@@ -17,6 +18,7 @@
  * - 使用三次B样条Parzen窗估计概率密度
  * - 实现解析梯度计算(非有限差分)
  * - 支持均匀分层采样策略
+ * - 支持任意维度的变换参数(刚体6参数/仿射12参数)
  * 
  * 数学原理:
  * MI = H(F) + H(M) - H(F,M)
@@ -31,8 +33,12 @@ class MattesMutualInformation
 public:
     using ImageType = itk::Image<float, 3>;
     using InterpolatorType = itk::LinearInterpolateImageFunction<ImageType, double>;
-    using TransformType = itk::Euler3DTransform<double>;
+    using TransformBaseType = itk::Transform<double, 3, 3>;
     using ParametersType = std::vector<double>;
+    
+    // 雅可比矩阵计算回调类型
+    using JacobianFunctionType = std::function<void(const ImageType::PointType&, 
+                                                     std::vector<std::array<double, 3>>&)>;
     
     // B样条阶数 (ITK使用3阶)
     static constexpr unsigned int BSplineOrder = 3;
@@ -41,16 +47,28 @@ public:
     MattesMutualInformation();
     ~MattesMutualInformation();
 
+    void SetVerbose(bool v) { m_Verbose = v; }
+    bool GetVerbose() const { return m_Verbose; }
+
     // 设置固定图像和移动图像
     void SetFixedImage(ImageType::Pointer fixedImage);
     void SetMovingImage(ImageType::Pointer movingImage);
     
-    // 设置变换(用于物理空间计算)
-    void SetTransform(TransformType::Pointer transform) { m_Transform = transform; }
+    // 设置变换(使用通用变换基类)
+    void SetTransform(TransformBaseType::Pointer transform) { m_Transform = transform; }
+    
+    // 设置雅可比矩阵计算函数(由外部提供,支持不同变换类型)
+    void SetJacobianFunction(JacobianFunctionType func) { m_JacobianFunction = func; }
+    
+    // 设置参数数量(根据变换类型: 刚体6, 仿射12)
+    void SetNumberOfParameters(unsigned int num) { m_NumberOfParameters = num; }
 
     // 设置参数
     void SetNumberOfHistogramBins(unsigned int bins) { m_NumberOfHistogramBins = bins; }
-    void SetNumberOfSpatialSamples(unsigned int samples) { m_NumberOfSpatialSamples = samples; }
+    void SetNumberOfSpatialSamples(unsigned int samples) { m_NumberOfSpatialSamples = samples; m_SamplingPercentage = 0.0; }
+    // 采样百分比 [0.0, 1.0], 当>0时优先使用百分比计算采样数 (默认 0.10)
+    void SetSamplingPercentage(double percent) { m_SamplingPercentage = percent; if (percent > 0.0) m_NumberOfSpatialSamples = 0; }
+    double GetSamplingPercentage() const { return m_SamplingPercentage; }
     void SetRandomSeed(unsigned int seed) { m_RandomSeed = seed; m_UseFixedSeed = true; }
     
     // 采样策略设置
@@ -78,7 +96,11 @@ private:
     ImageType::Pointer m_FixedImage;
     ImageType::Pointer m_MovingImage;
     InterpolatorType::Pointer m_Interpolator;
-    TransformType::Pointer m_Transform;
+    TransformBaseType::Pointer m_Transform;
+    
+    // 雅可比矩阵计算函数(外部提供)
+    JacobianFunctionType m_JacobianFunction;
+    unsigned int m_NumberOfParameters;
 
     // 移动图像梯度(用于解析梯度计算)
     std::array<ImageType::Pointer, 3> m_MovingImageGradient;
@@ -87,6 +109,7 @@ private:
     // 直方图参数
     unsigned int m_NumberOfHistogramBins;
     unsigned int m_NumberOfSpatialSamples;
+    double m_SamplingPercentage;
     unsigned int m_RandomSeed;
     bool m_UseFixedSeed;
     bool m_UseStratifiedSampling;
@@ -128,6 +151,7 @@ private:
 
     // 随机数生成器
     std::mt19937 m_RandomGenerator;
+    bool m_Verbose; // 调试输出
 
     // ============ 内部方法 ============
     
@@ -152,10 +176,6 @@ private:
     void ComputeJointPDFAndDerivatives();
     double ComputeMutualInformation();
     void ComputeAnalyticalGradient(ParametersType& derivative);
-    
-    // 变换雅可比矩阵
-    void ComputeTransformJacobian(const ImageType::PointType& point,
-                                  std::vector<std::array<double, 3>>& jacobian);
     
     // 辅助函数
     double ComputeFixedImageContinuousIndex(double value) const;

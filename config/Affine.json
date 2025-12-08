@@ -1,0 +1,25 @@
+{
+    "_comment": "Registration Configuration File - Affine Transform",
+    
+    "transformType": "Affine",
+    
+    "_section_metric": "=== Metric Parameters ===",
+    "numberOfHistogramBins": 50,
+    "numberOfSpatialSamples": 100000,
+    
+    "_section_optimizer": "=== Optimizer Parameters ===",
+    "learningRate": 0.3,
+    "minimumStepLength": 1e-5,
+    "numberOfIterations": 500,
+    "relaxationFactor": 0.7,
+    "gradientMagnitudeTolerance": 1e-5,
+    
+    "_section_multiresolution": "=== Multi-Resolution Parameters ===",
+    "numberOfLevels": 4,
+    "shrinkFactors": [8, 4, 2, 1],
+    "smoothingSigmas": [4.0, 2.0, 1.0, 0.0],
+    
+    "_section_sampling": "=== Sampling Parameters ===",
+    "useStratifiedSampling": true,
+    "randomSeed": 121212
+}

@@ -19,6 +19,7 @@ set(SOURCES
     src/MattesMutualInformation.cpp
     src/RegularStepGradientDescentOptimizer.cpp
     src/ImageRegistration.cpp
+    src/ConfigManager.cpp
     src/main.cpp
 )
 
@@ -27,6 +28,7 @@ set(HEADERS
     include/MattesMutualInformation.h
     include/RegularStepGradientDescentOptimizer.h
     include/ImageRegistration.h
+    include/ConfigManager.h
 )
 
 # 创建可执行文件

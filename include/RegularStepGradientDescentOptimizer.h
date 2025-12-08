@@ -53,7 +53,7 @@ public:
     void SetSetParametersFunction(SetParametersType setFunc) { m_SetParameters = setFunc; }
 
     // 设置参数数量
-    void SetNumberOfParameters(unsigned int num) { m_NumberOfParameters = num; }
+    void SetNumberOfParameters(unsigned int num);
 
     // 执行优化
     void StartOptimization();
@@ -70,6 +70,18 @@ public:
 
     // 设置观察者回调(用于输出优化过程)
     void SetObserver(ObserverType observer) { m_Observer = observer; }
+
+    // 设置观察者每隔多少迭代调用一次 (默认 10), 如果 verbose 则每次迭代调用
+    void SetObserverIterationInterval(unsigned int interval) { m_ObserverIterationInterval = interval; }
+    unsigned int GetObserverIterationInterval() const { return m_ObserverIterationInterval; }
+
+    // 调试日志
+    void SetVerbose(bool verbose) { m_Verbose = verbose; }
+    bool GetVerbose() const { return m_Verbose; }
+
+    // 设置参数更新的最大值以避免过大的跳跃(单位根据参数：弧度或mm)
+    void SetMaxParameterUpdate(const ParametersType& maxUpdate) { m_MaxParameterUpdate = maxUpdate; }
+    const ParametersType& GetMaxParameterUpdate() const { return m_MaxParameterUpdate; }
 
 private:
     // 优化参数
@@ -91,6 +103,7 @@ private:
     ParametersType m_CurrentGradient;
     ParametersType m_PreviousParameters;  // 用于回退
     ParametersType m_BestParameters;      // 最佳参数
+    ParametersType m_MaxParameterUpdate; // 每个参数最大更新值
     StopCondition m_StopCondition;
 
     // 代价函数和梯度函数
@@ -102,6 +115,8 @@ private:
 
     // 观察者
     ObserverType m_Observer;
+    unsigned int m_ObserverIterationInterval;
+    bool m_Verbose;
 
     // 内部方法
     void AdvanceOneStep();

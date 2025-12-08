@@ -13,11 +13,13 @@
 
 MattesMutualInformation::MattesMutualInformation()
     : m_NumberOfHistogramBins(50)
-    , m_NumberOfSpatialSamples(100000)
+    , m_NumberOfSpatialSamples(0) // will be computed from sampling percentage by default
+    , m_SamplingPercentage(0.10)   // default 10%
     , m_RandomSeed(121212)
     , m_UseFixedSeed(true)
     , m_UseStratifiedSampling(true)  // 默认使用分层采样
     , m_NumberOfValidSamples(0)
+    , m_NumberOfParameters(6)  // 默认刚体6参数
     , m_FixedImageMin(0.0)
     , m_FixedImageMax(1.0)
     , m_MovingImageMin(0.0)
@@ -76,27 +78,42 @@ void MattesMutualInformation::Initialize()
     ComputeImageExtrema();
     
     // 计算bin大小
-    // ITK在边界各留2个bin的padding用于B样条
-    const unsigned int padding = 2;
-    m_FixedImageBinSize = (m_FixedImageMax - m_FixedImageMin) / 
-                          static_cast<double>(m_NumberOfHistogramBins - 2 * padding - 1);
-    m_MovingImageBinSize = (m_MovingImageMax - m_MovingImageMin) / 
-                           static_cast<double>(m_NumberOfHistogramBins - 2 * padding - 1);
-    
-    // 计算移动图像梯度(用于解析梯度)
-    ComputeMovingImageGradient();
+    m_FixedImageBinSize = (m_FixedImageMax - m_FixedImageMin) / m_NumberOfHistogramBins;
+    m_MovingImageBinSize = (m_MovingImageMax - m_MovingImageMin) / m_NumberOfHistogramBins;
+
+    // 基于百分比计算采样数量
+    if (m_SamplingPercentage > 0.0 && m_NumberOfSpatialSamples == 0)
+    {
+        auto region = m_FixedImage->GetLargestPossibleRegion();
+        auto size = region.GetSize();
+        unsigned long totalVoxels = static_cast<unsigned long>(size[0]) * size[1] * size[2];
+        m_NumberOfSpatialSamples = static_cast<unsigned int>(totalVoxels * m_SamplingPercentage + 0.5);
+    }
+
+    if (m_Verbose)
+    {
+        std::cout << "[Metric Debug] Initialize: samplingPercentage=" << m_SamplingPercentage
+                  << " numberOfSpatialSamples=" << m_NumberOfSpatialSamples << std::endl;
+    }
 
     // 在固定图像上采样
     SampleFixedImage();
 
-    // 初始化直方图 (加padding用于B样条边界处理)
+    // 计算移动图像梯度供解析梯度使用
+    ComputeMovingImageGradient();
+    if (m_Verbose)
+    {
+        std::cout << "[Metric Debug] Computed moving image gradient" << std::endl;
+    }
+
+    // 初始化直方图
     m_JointPDF.resize(m_NumberOfHistogramBins, 
                      std::vector<double>(m_NumberOfHistogramBins, 0.0));
     m_FixedImageMarginalPDF.resize(m_NumberOfHistogramBins, 0.0);
     m_MovingImageMarginalPDF.resize(m_NumberOfHistogramBins, 0.0);
     
-    // 初始化梯度PDF存储 (6个参数)
-    m_JointPDFDerivatives.resize(6);
+    // 初始化梯度PDF存储 (根据参数数量动态分配)
+    m_JointPDFDerivatives.resize(m_NumberOfParameters);
     for (auto& paramDerivative : m_JointPDFDerivatives)
     {
         paramDerivative.resize(m_NumberOfHistogramBins,
@@ -216,13 +233,47 @@ void MattesMutualInformation::ComputeMovingImageGradient()
 
 void MattesMutualInformation::SampleFixedImage()
 {
-    if (m_UseStratifiedSampling)
+    // 随机采样固定图像
+    using IteratorType = itk::ImageRegionConstIteratorWithIndex<ImageType>;
+    ImageType::RegionType region = m_FixedImage->GetLargestPossibleRegion();
+
+    // 收集所有有效点的索引
+    std::vector<ImageType::IndexType> allIndices;
+    IteratorType it(m_FixedImage, region);
+
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
     {
-        SampleFixedImageStratified();
+        allIndices.push_back(it.GetIndex());
     }
-    else
+
+    // 使用固定种子随机打乱
+    std::shuffle(allIndices.begin(), allIndices.end(), m_RandomGenerator);
+
+    unsigned int numSamples = std::min(m_NumberOfSpatialSamples, 
+                                      static_cast<unsigned int>(allIndices.size()));
+    
+    m_SamplePoints.clear();
+    m_SamplePoints.reserve(numSamples);
+
+    for (unsigned int i = 0; i < numSamples; ++i)
     {
-        SampleFixedImageRandom();
+        SamplePoint sample;
+        m_FixedImage->TransformIndexToPhysicalPoint(allIndices[i], sample.fixedPoint);
+        sample.fixedValue = m_FixedImage->GetPixel(allIndices[i]);
+        // compute parzen window index and weights for fixed image intensity
+        double fixedContinuousIndex = ComputeFixedImageContinuousIndex(sample.fixedValue);
+        int fixedStartIndex;
+        ComputeBSplineWeights(fixedContinuousIndex, fixedStartIndex, sample.fixedBSplineWeights);
+        sample.fixedParzenWindowIndex = fixedStartIndex;
+        m_SamplePoints.push_back(sample);
+    }
+
+    m_NumberOfValidSamples = static_cast<unsigned int>(m_SamplePoints.size());
+
+    if (m_Verbose)
+    {
+        std::cout << "[Metric Debug] SampleFixedImage: numSamples=" << numSamples
+                  << " validSamples=" << m_NumberOfValidSamples << std::endl;
     }
 }
 
@@ -451,60 +502,6 @@ double MattesMutualInformation::ComputeMovingImageContinuousIndex(double value) 
 }
 
 // ============================================================================
-// 计算变换的雅可比矩阵
-// ============================================================================
-
-void MattesMutualInformation::ComputeTransformJacobian(
-    const ImageType::PointType& point,
-    std::vector<std::array<double, 3>>& jacobian)
-{
-    // Euler3DTransform的雅可比矩阵
-    // 参数: [rotX, rotY, rotZ, transX, transY, transZ]
-    // 输出点 = R * (输入点 - center) + center + translation
-    
-    // 获取变换参数
-    auto params = m_Transform->GetParameters();
-    auto center = m_Transform->GetCenter();
-    
-    double rx = params[0];  // rotation around X
-    double ry = params[1];  // rotation around Y
-    double rz = params[2];  // rotation around Z
-    
-    // 计算相对于中心的点
-    double px = point[0] - center[0];
-    double py = point[1] - center[1];
-    double pz = point[2] - center[2];
-    
-    // 预计算三角函数
-    double cx = std::cos(rx), sx = std::sin(rx);
-    double cy = std::cos(ry), sy = std::sin(ry);
-    double cz = std::cos(rz), sz = std::sin(rz);
-    
-    jacobian.resize(6);
-    
-    // 对 rotX 的导数
-    // dR/d(rx) * (p - center)
-    jacobian[0][0] = 0.0;
-    jacobian[0][1] = (-sx*sy*cz - cx*sz) * px + (-sx*sy*sz + cx*cz) * py + (-sx*cy) * pz;
-    jacobian[0][2] = (cx*sy*cz - sx*sz) * px + (cx*sy*sz + sx*cz) * py + (cx*cy) * pz;
-    
-    // 对 rotY 的导数
-    jacobian[1][0] = (-sy*cz) * px + (-sy*sz) * py + (-cy) * pz;
-    jacobian[1][1] = (cx*cy*cz) * px + (cx*cy*sz) * py + (-cx*sy) * pz;
-    jacobian[1][2] = (sx*cy*cz) * px + (sx*cy*sz) * py + (-sx*sy) * pz;
-    
-    // 对 rotZ 的导数
-    jacobian[2][0] = (-cy*sz) * px + (cy*cz) * py;
-    jacobian[2][1] = (-sx*sy*sz - cx*cz) * px + (sx*sy*cz - cx*sz) * py;
-    jacobian[2][2] = (cx*sy*sz - sx*cz) * px + (-cx*sy*cz - sx*sz) * py;
-    
-    // 对平移的导数 (单位矩阵)
-    jacobian[3] = {1.0, 0.0, 0.0};
-    jacobian[4] = {0.0, 1.0, 0.0};
-    jacobian[5] = {0.0, 0.0, 1.0};
-}
-
-// ============================================================================
 // 核心计算: 联合PDF和导数
 // ============================================================================
 
@@ -513,6 +510,11 @@ void MattesMutualInformation::ComputeJointPDFAndDerivatives()
     if (!m_Transform)
     {
         throw std::runtime_error("Transform not set in metric");
+    }
+    
+    if (!m_JacobianFunction)
+    {
+        throw std::runtime_error("Jacobian function not set in metric");
     }
 
     // 清空直方图
@@ -571,13 +573,13 @@ void MattesMutualInformation::ComputeJointPDFAndDerivatives()
             }
         }
         
-        // 计算变换雅可比矩阵
-        ComputeTransformJacobian(sample.fixedPoint, jacobian);
+        // 使用外部提供的雅可比函数计算变换雅可比矩阵
+        m_JacobianFunction(sample.fixedPoint, jacobian);
         
         // 计算 dm/dp = gradient_M^T * dT/dp
         // dm/dp[k] = sum_d (gradient_M[d] * jacobian[k][d])
-        std::array<double, 6> dmDp;
-        for (int k = 0; k < 6; ++k)
+        std::vector<double> dmDp(m_NumberOfParameters, 0.0);
+        for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
         {
             dmDp[k] = 0.0;
             for (int d = 0; d < 3; ++d)
@@ -588,6 +590,21 @@ void MattesMutualInformation::ComputeJointPDFAndDerivatives()
             dmDp[k] /= m_MovingImageBinSize;
         }
 
+        // Print debug info for first few samples
+        if (m_Verbose && m_NumberOfValidSamples < 5)
+        {
+            std::cout << "[Metric Debug] Sample " << m_NumberOfValidSamples << " fixedVal=" << sample.fixedValue
+                      << " movedVal=" << movingValue << std::endl;
+            std::cout << "  movingGradient: " << movingGradient[0] << " " << movingGradient[1] << " " << movingGradient[2] << std::endl;
+            std::cout << "  jacobian[0]: " << jacobian[0][0] << " " << jacobian[0][1] << " " << jacobian[0][2] << std::endl;
+            std::cout << "  dmDp (first 6): ";
+            for (unsigned int k = 0; k < std::min<unsigned int>(6, dmDp.size()); ++k)
+            {
+                std::cout << dmDp[k] << " ";
+            }
+            std::cout << std::endl;
+        }
+        
         // 累加到联合PDF和导数PDF
         for (int fi = 0; fi < 4; ++fi)
         {
@@ -612,7 +629,7 @@ void MattesMutualInformation::ComputeJointPDFAndDerivatives()
                 
                 // 导数PDF贡献
                 // dP/dp = B_fixed * dB_moving/dm * dm/dp
-                for (int k = 0; k < 6; ++k)
+                for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
                 {
                     double derivContribution = fixedWeight * movingDerivWeight * dmDp[k];
                     m_JointPDFDerivatives[k][fixedBin][movingBin] += derivContribution;
@@ -637,12 +654,27 @@ void MattesMutualInformation::ComputeJointPDFAndDerivatives()
                 m_MovingImageMarginalPDF[j] += m_JointPDF[i][j];
                 
                 // 归一化导数
-                for (int k = 0; k < 6; ++k)
+                for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
                 {
                     m_JointPDFDerivatives[k][i][j] *= normFactor;
                 }
             }
         }
+    }
+
+    if (m_Verbose)
+    {
+        unsigned int nonZeroBins = 0;
+        for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
+        {
+            for (unsigned int j = 0; j < m_NumberOfHistogramBins; ++j)
+            {
+                if (m_JointPDF[i][j] > 0.0)
+                    ++nonZeroBins;
+            }
+        }
+        double fillRatio = static_cast<double>(nonZeroBins) / (m_NumberOfHistogramBins * m_NumberOfHistogramBins);
+        std::cout << "[Metric Debug] JointPDF filled bins: " << nonZeroBins << " (" << fillRatio << ")" << std::endl;
     }
 }
 
@@ -694,7 +726,7 @@ void MattesMutualInformation::ComputeAnalyticalGradient(ParametersType& derivati
     // dMI/dp = sum_f sum_m [ dP(f,m)/dp * log(P(f,m) / P(m)) ]
     
     const double epsilon = 1e-16;
-    derivative.resize(6, 0.0);
+    derivative.resize(m_NumberOfParameters, 0.0);
     
     for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
     {
@@ -709,7 +741,7 @@ void MattesMutualInformation::ComputeAnalyticalGradient(ParametersType& derivati
             // log(P(f,m) / P(m))
             double logTerm = std::log(jointProb / movingProb);
             
-            for (int k = 0; k < 6; ++k)
+            for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
             {
                 derivative[k] += m_JointPDFDerivatives[k][i][j] * logTerm;
             }
@@ -717,9 +749,26 @@ void MattesMutualInformation::ComputeAnalyticalGradient(ParametersType& derivati
     }
     
     // 因为我们最小化负互信息,所以梯度取负
-    for (int k = 0; k < 6; ++k)
+    for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
     {
         derivative[k] = -derivative[k];
+    }
+
+    if (m_Verbose)
+    {
+        double maxAbs = 0.0, sumAbs = 0.0;
+        for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
+        {
+            double a = std::abs(derivative[k]);
+            if (a > maxAbs) maxAbs = a;
+            sumAbs += a;
+        }
+        double meanAbs = sumAbs / m_NumberOfParameters;
+        std::cout << "[Metric Debug] Gradient stats: maxAbs=" << maxAbs << " meanAbs=" << meanAbs << std::endl;
+        std::cout << "  gradient: ";
+        for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
+            std::cout << std::fixed << std::setprecision(6) << derivative[k] << " ";
+        std::cout << std::endl;
     }
 }
 

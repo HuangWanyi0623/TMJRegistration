@@ -18,9 +18,14 @@ RegularStepGradientDescentOptimizer::RegularStepGradientDescentOptimizer()
     , m_CurrentStepLength(1.0)
     , m_PreviousValue(std::numeric_limits<double>::max())
     , m_StopCondition(MAXIMUM_ITERATIONS)
+    , m_Verbose(false)
+    , m_ObserverIterationInterval(10)
+    , m_MaxParameterUpdate(m_NumberOfParameters, 1.0) // default max update
 {
     // 默认尺度 - 全为1
     m_Scales.resize(6, 1.0);
+    // Default max parameter updates: rotations ~0.2 rad, translations ~20mm
+    m_MaxParameterUpdate = ParametersType{0.2, 0.2, 0.2, 20.0, 20.0, 20.0};
 }
 
 RegularStepGradientDescentOptimizer::~RegularStepGradientDescentOptimizer()
@@ -60,11 +65,19 @@ void RegularStepGradientDescentOptimizer::StartOptimization()
     m_CurrentValue = m_CostFunction();
     m_BestValue = m_CurrentValue;
 
+    if (m_Verbose)
+    {
+        std::cout << "[Optimizer Debug] Initial parameters: ";
+        for (double p : m_PreviousParameters) std::cout << std::fixed << std::setprecision(6) << p << " ";
+        std::cout << "\n";
+        std::cout << "[Optimizer Debug] Initial value: " << m_CurrentValue << std::endl;
+    }
+
     // 开始迭代
     for (m_CurrentIteration = 0; m_CurrentIteration < m_NumberOfIterations; ++m_CurrentIteration)
     {
         // 调用观察者
-        if (m_Observer && m_CurrentIteration % 10 == 0)
+        if (m_Observer && (m_Verbose || (m_CurrentIteration % m_ObserverIterationInterval == 0)))
         {
             m_Observer(m_CurrentIteration, m_CurrentValue, m_CurrentStepLength);
         }
@@ -127,6 +140,30 @@ void RegularStepGradientDescentOptimizer::AdvanceOneStep()
         newParameters[i] = currentParams[i] - m_CurrentStepLength * direction;
     }
 
+    // clamp parameter updates to avoid extreme jumps
+    for (unsigned int i = 0; i < m_NumberOfParameters && i < m_MaxParameterUpdate.size(); ++i)
+    {
+        double delta = newParameters[i] - currentParams[i];
+        if (delta > m_MaxParameterUpdate[i]) delta = m_MaxParameterUpdate[i];
+        if (delta < -m_MaxParameterUpdate[i]) delta = -m_MaxParameterUpdate[i];
+        newParameters[i] = currentParams[i] + delta;
+    }
+
+    // 打印调试信息
+    if (m_Verbose)
+    {
+        std::cout << "[Optimizer Debug] Iter=" << m_CurrentIteration << " gradMag=" << gradientMagnitude
+                  << " step=" << m_CurrentStepLength << "\n";
+        std::cout << "  gradient: ";
+        for (unsigned int i = 0; i < std::min<unsigned int>(m_CurrentGradient.size(), 6); ++i)
+            std::cout << std::fixed << std::setprecision(6) << m_CurrentGradient[i] << " ";
+        std::cout << "\n";
+        std::cout << "  param update: ";
+        for (unsigned int i = 0; i < std::min<unsigned int>(newParameters.size(), 6); ++i)
+            std::cout << std::fixed << std::setprecision(6) << newParameters[i] - currentParams[i] << " ";
+        std::cout << "\n";
+    }
+
     // 应用新参数
     m_SetParameters(newParameters);
 
@@ -162,4 +199,24 @@ double RegularStepGradientDescentOptimizer::ComputeScaledGradientMagnitude(const
         magnitude += scaledGrad * scaledGrad;
     }
     return std::sqrt(magnitude);
+}
+
+void RegularStepGradientDescentOptimizer::SetNumberOfParameters(unsigned int num)
+{
+    m_NumberOfParameters = num;
+    // resize gradient and max updates if needed
+    m_CurrentGradient.resize(m_NumberOfParameters);
+    if (m_MaxParameterUpdate.size() != m_NumberOfParameters)
+    {
+        // keep existing values or set sensible defaults
+        m_MaxParameterUpdate.resize(m_NumberOfParameters, 1.0);
+        if (m_NumberOfParameters >= 6)
+        {
+            // default for rigid-like: rotation small, translation bigger
+            for (unsigned int i = 0; i < m_NumberOfParameters; ++i)
+            {
+                if (i < 3) m_MaxParameterUpdate[i] = 0.2; else m_MaxParameterUpdate[i] = 20.0;
+            }
+        }
+    }
 }
