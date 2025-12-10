@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
+#include <sstream>
 
 // ============================================================================
 // 构造函数和析构函数
@@ -141,15 +142,86 @@ bool ConfigManager::ParseJsonFile(const std::string& content)
     std::string sampPct = ExtractValue(content, "samplingPercentage");
     if (!sampPct.empty()) m_Config.samplingPercentage = std::stod(sampPct);
         
-        // 解析优化器参数
+        // 解析优化器参数 - 学习率支持单值或数组
         std::string lr = ExtractValue(content, "learningRate");
-        if (!lr.empty()) m_Config.learningRate = std::stod(lr);
+        if (!lr.empty())
+        {
+            // 尝试作为单个值解析
+            try
+            {
+                double singleLR = std::stod(lr);
+                m_Config.learningRate.clear();
+                m_Config.learningRate.push_back(singleLR);
+            }
+            catch (...)
+            {
+                // 如果失败，尝试作为数组解析
+                auto lrArray = ExtractArray(content, "learningRate");
+                if (!lrArray.empty())
+                {
+                    m_Config.learningRate.clear();
+                    for (const auto& s : lrArray)
+                    {
+                        m_Config.learningRate.push_back(std::stod(s));
+                    }
+                }
+            }
+        }
+        else
+        {
+            // 尝试作为数组解析
+            auto lrArray = ExtractArray(content, "learningRate");
+            if (!lrArray.empty())
+            {
+                m_Config.learningRate.clear();
+                for (const auto& s : lrArray)
+                {
+                    m_Config.learningRate.push_back(std::stod(s));
+                }
+            }
+        }
         
         std::string minStep = ExtractValue(content, "minimumStepLength");
         if (!minStep.empty()) m_Config.minimumStepLength = std::stod(minStep);
         
+        // 解析迭代次数 - 支持单值或数组
         std::string iter = ExtractValue(content, "numberOfIterations");
-        if (!iter.empty()) m_Config.numberOfIterations = std::stoul(iter);
+        if (!iter.empty())
+        {
+            // 尝试作为单个值解析
+            try
+            {
+                unsigned int singleIter = std::stoul(iter);
+                m_Config.numberOfIterations.clear();
+                m_Config.numberOfIterations.push_back(singleIter);
+            }
+            catch (...)
+            {
+                // 如果失败，尝试作为数组解析
+                auto iterArray = ExtractArray(content, "numberOfIterations");
+                if (!iterArray.empty())
+                {
+                    m_Config.numberOfIterations.clear();
+                    for (const auto& s : iterArray)
+                    {
+                        m_Config.numberOfIterations.push_back(std::stoul(s));
+                    }
+                }
+            }
+        }
+        else
+        {
+            // 尝试作为数组解析
+            auto iterArray = ExtractArray(content, "numberOfIterations");
+            if (!iterArray.empty())
+            {
+                m_Config.numberOfIterations.clear();
+                for (const auto& s : iterArray)
+                {
+                    m_Config.numberOfIterations.push_back(std::stoul(s));
+                }
+            }
+        }
         
         std::string relax = ExtractValue(content, "relaxationFactor");
         if (!relax.empty()) m_Config.relaxationFactor = std::stod(relax);
@@ -247,9 +319,27 @@ std::string ConfigManager::GenerateJson() const
     oss << "    \"samplingPercentage\": " << std::fixed << std::setprecision(3) << m_Config.samplingPercentage << ",\n";
     oss << "    \n";
     oss << "    \"_section_optimizer\": \"=== Optimizer Parameters ===\",\n";
-    oss << "    \"learningRate\": " << std::fixed << std::setprecision(4) << m_Config.learningRate << ",\n";
+    
+    // 输出学习率数组
+    oss << "    \"learningRate\": [";
+    for (size_t i = 0; i < m_Config.learningRate.size(); ++i)
+    {
+        oss << std::fixed << std::setprecision(4) << m_Config.learningRate[i];
+        if (i < m_Config.learningRate.size() - 1) oss << ", ";
+    }
+    oss << "],\n";
+    
     oss << "    \"minimumStepLength\": " << std::scientific << std::setprecision(4) << m_Config.minimumStepLength << ",\n";
-    oss << "    \"numberOfIterations\": " << m_Config.numberOfIterations << ",\n";
+    
+    // 输出迭代次数数组
+    oss << "    \"numberOfIterations\": [";
+    for (size_t i = 0; i < m_Config.numberOfIterations.size(); ++i)
+    {
+        oss << m_Config.numberOfIterations[i];
+        if (i < m_Config.numberOfIterations.size() - 1) oss << ", ";
+    }
+    oss << "],\n";
+    
     oss << "    \"relaxationFactor\": " << std::fixed << std::setprecision(2) << m_Config.relaxationFactor << ",\n";
     oss << "    \"gradientMagnitudeTolerance\": " << std::scientific << std::setprecision(1) << m_Config.gradientMagnitudeTolerance << ",\n";
     oss << "    \n";
@@ -317,9 +407,27 @@ void ConfigManager::PrintConfig() const
     std::cout << "  Histogram Bins: " << m_Config.numberOfHistogramBins << std::endl;
     std::cout << "  Spatial Samples: " << m_Config.numberOfSpatialSamples << std::endl;
     std::cout << "  Sampling Percentage: " << m_Config.samplingPercentage << std::endl;
-    std::cout << "  Learning Rate: " << m_Config.learningRate << std::endl;
+    
+    // 打印学习率数组
+    std::cout << "  Learning Rate: [";
+    for (size_t i = 0; i < m_Config.learningRate.size(); ++i)
+    {
+        std::cout << m_Config.learningRate[i];
+        if (i < m_Config.learningRate.size() - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    
     std::cout << "  Min Step Length: " << m_Config.minimumStepLength << std::endl;
-    std::cout << "  Max Iterations: " << m_Config.numberOfIterations << std::endl;
+    
+    // 打印迭代次数数组
+    std::cout << "  Max Iterations: [";
+    for (size_t i = 0; i < m_Config.numberOfIterations.size(); ++i)
+    {
+        std::cout << m_Config.numberOfIterations[i];
+        if (i < m_Config.numberOfIterations.size() - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    
     std::cout << "  Relaxation Factor: " << m_Config.relaxationFactor << std::endl;
     std::cout << "  Gradient Tolerance: " << m_Config.gradientMagnitudeTolerance << std::endl;
     std::cout << "  Multi-Resolution Levels: " << m_Config.numberOfLevels << std::endl;

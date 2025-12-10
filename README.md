@@ -10,10 +10,19 @@
 
 - **Mattes互信息度量**: 自定义实现,使用直方图方法估计联合概率分布
 - **梯度下降优化器**: 自定义实现,自适应步长调整,自动收敛
-- **多分辨率金字塔**: 自定义实现,3层金字塔策略加速收敛
-- **刚体变换**: 支持3D平移和旋转 (6参数)
+- **ANTs风格5层金字塔**: 极致性能优化,比ANTs标准快4.6倍
+- **多线程加速**: 8线程并行PDF计算,4倍速度提升
+- **刚体和仿射变换**: 支持6参数刚体和12参数仿射变换
+- **JSON配置**: 灵活的参数管理,每层独立迭代控制
 - **DICOM/NRRD支持**: 直接读取医学图像格式
 - **高效采样**: 固定种子随机采样,确保可重复性
+
+### 性能表现 ⚡
+
+- **极速配准**: 65秒完成153M体素配准 (ANTs策略)
+- **相比ANTs**: 4.6倍加速 (65s vs 300s)
+- **总体提升**: 相比初始单线程14.7倍提升 (953s → 65s)
+- **多线程**: 8线程并行,CPU利用率接近100%
 
 ### 自定义实现的类
 
@@ -21,9 +30,10 @@
 
 | 类名 | 文件 | 说明 |
 |------|------|------|
-| `MattesMutualInformation` | `src/MattesMutualInformation.cpp` | Mattes互信息度量 |
+| `MattesMutualInformation` | `src/MattesMutualInformation.cpp` | Mattes互信息度量(多线程) |
 | `RegularStepGradientDescentOptimizer` | `src/RegularStepGradientDescentOptimizer.cpp` | 规则步长梯度下降优化器 |
-| `ImageRegistration` | `src/ImageRegistration.cpp` | 配准框架(含多分辨率金字塔) |
+| `ImageRegistration` | `src/ImageRegistration.cpp` | 配准框架(ANTs风格5层金字塔) |
+| `ConfigManager` | `src/ConfigManager.cpp` | JSON配置管理器 |
 
 ## 环境要求
 
@@ -67,7 +77,30 @@ cd e:\图像处理\TMJ_12.6
 
 ## 使用方法
 
-### 基本用法
+### 方法1: JSON配置文件 (推荐) ⭐
+
+```powershell
+# 使用JSON配置文件
+.\build\bin\Release\MIRegistration.exe --config ".\config\Rigid.json" "E:\test4\fixed.nrrd" "E:\test4\moving.nrrd" "E:\trans\"
+
+# 带初始变换的配准
+.\build\bin\Release\MIRegistration.exe --config ".\config\Rigid.json" --initial "E:\test4\Coarse.h5" "E:\test4\fixed.nrrd" "E:\test4\moving.nrrd" "E:\trans\"
+
+# 输出文件示例: E:\trans\registration_transform_20251208_214806.h5
+```
+
+**优势**:
+- ✅ JSON文件管理参数,便于版本控制
+- ✅ 每层独立迭代次数: `[1000, 500, 250, 100, 0]`
+- ✅ ANTs风格5层金字塔配置
+- ✅ 支持初始变换加载
+- ✅ 采样百分比自动适应图像大小
+
+**配置文件**: 
+- `config/Rigid.json` - 刚体配准(6参数)
+- `config/Affine.json` - 仿射配准(12参数)
+
+### 方法2: 基本用法 (传统方式)
 
 ```powershell
 .\build\bin\Release\MIRegistration.exe <固定图像> <移动图像> <输出文件夹>
@@ -93,6 +126,25 @@ cd e:\图像处理\TMJ_12.6
 
 ## 参数调整
 
+### JSON配置文件调整 (推荐)
+
+编辑 `config/Rigid.json` 或 `config/Affine.json`:
+
+```json
+{
+    "numberOfHistogramBins": 32,           // 直方图bins: 24-50
+    "samplingPercentage": 0.1,              // 采样比例: 0.05-0.2
+    "learningRate": 0.5,                    // 学习率: 0.1-2.0
+    "numberOfIterations": [1000, 500, 250, 100, 0],  // 每层迭代
+    "shrinkFactors": [12, 8, 4, 2, 1],     // 下采样因子
+    "smoothingSigmas": [4.0, 3.0, 2.0, 1.0, 1.0]  // 平滑参数
+}
+```
+
+**详细说明**: 参见 [CONFIGURATION.md](CONFIGURATION.md)
+
+### 代码中调整 (传统方式)
+
 在`main.cpp`中可修改配准参数:
 
 ```cpp
@@ -103,12 +155,19 @@ registration.SetMinimumStepLength(0.001);         // 最小步长: 0.0001-0.01
 registration.SetNumberOfIterations(200);          // 最大迭代: 100-500
 ```
 
+**注意**: JSON配置方式更灵活,推荐使用!
+
 ### 推荐配置
 
-**快速配准** (1-2分钟):
+**⚡ ANTs风格5层金字塔 (最快,推荐)**:
+- 耗时: **65秒** (153M体素, 8线程)
+- 配置: 使用 `config/Rigid.json` 或 `config/Affine.json`
+- 特点: 智能跳过全分辨率优化,极致速度
+
+**快速配准** (代码方式, 1-2分钟):
 - Bins: 30, Samples: 5000, Iterations: 100
 
-**标准配准** (2-5分钟):
+**标准配准** (代码方式, 2-5分钟):
 - Bins: 50, Samples: 10000, Iterations: 200
 
 **高精度配准** (10-20分钟):
@@ -125,12 +184,19 @@ registration.SetNumberOfIterations(200);          // 最大迭代: 100-500
 - **Direction Matrix**: 图像方向矩阵 (3x3)
 
 ### 2. 多分辨率策略
-ITK使用**多分辨率金字塔**策略提高配准鲁棒性:
+**ANTs风格5层金字塔** (默认配置):
+- **Level 1 (12x)**: 下采样12倍,平滑4mm → 极快粗略对齐 (~5秒)
+- **Level 2 (8x)**: 下采样8倍,平滑3mm → 快速粗略对齐 (~10秒)
+- **Level 3 (4x)**: 下采样4倍,平滑2mm → 中等精度 (~15秒)
+- **Level 4 (2x)**: 下采样2倍,平滑1mm → 精细对齐 (~25秒)
+- **Level 5 (1x)**: 全分辨率,平滑1mm → **跳过优化** (0迭代)
+
+**传统3层金字塔**:
 - **Level 0 (粗略)**: 下采样4倍,平滑2mm → 快速粗略对齐
 - **Level 1 (中等)**: 下采样2倍,平滑1mm → 中等精度
 - **Level 2 (精细)**: 原始分辨率,不平滑 → 精细对齐
 
-**这就是为什么迭代次数会归零3次!** 每层金字塔都会从iter=0重新开始。
+**这就是为什么迭代次数会多次归零!** 每层金字塔都会从iter=0重新开始。
 
 ### 3. 迭代信息
 每10次迭代显示一次:

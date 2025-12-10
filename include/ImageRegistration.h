@@ -72,9 +72,9 @@ public:
     void SetNumberOfHistogramBins(unsigned int bins) { m_NumberOfHistogramBins = bins; }
     void SetNumberOfSamples(unsigned int samples) { m_NumberOfSpatialSamples = samples; }
     void SetNumberOfSpatialSamples(unsigned int samples) { m_NumberOfSpatialSamples = samples; }
-    void SetLearningRate(double rate) { m_LearningRate = rate; }
+    void SetLearningRate(const std::vector<double>& rates) { m_LearningRate = rates; }
     void SetMinimumStepLength(double stepLength) { m_MinimumStepLength = stepLength; }
-    void SetNumberOfIterations(unsigned int iterations) { m_NumberOfIterations = iterations; }
+    void SetNumberOfIterations(const std::vector<unsigned int>& iterations) { m_NumberOfIterations = iterations; }
     void SetRelaxationFactor(double factor) { m_RelaxationFactor = factor; }
     void SetGradientMagnitudeTolerance(double tol) { m_GradientMagnitudeTolerance = tol; }
     
@@ -142,9 +142,9 @@ private:
     unsigned int m_NumberOfHistogramBins;
     unsigned int m_NumberOfSpatialSamples;
     double m_SamplingPercentage; // 比例形式: 0.1 = 10%
-    double m_LearningRate;
+    std::vector<double> m_LearningRate;  // 支持分层学习率
     double m_MinimumStepLength;
-    unsigned int m_NumberOfIterations;
+    std::vector<unsigned int> m_NumberOfIterations;  // 支持分层迭代次数
     double m_RelaxationFactor;
     double m_GradientMagnitudeTolerance;
     

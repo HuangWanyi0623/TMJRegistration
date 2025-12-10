@@ -20,7 +20,7 @@ ImageRegistration::ImageRegistration()
     , m_NumberOfSpatialSamples(100000)
     , m_LearningRate(0.5)
     , m_MinimumStepLength(0.0001)
-    , m_NumberOfIterations(300)
+    , m_NumberOfIterations({300})  // 默认单层300次迭代
     , m_RelaxationFactor(0.8)
     , m_GradientMagnitudeTolerance(1e-4)
     , m_NumberOfLevels(3)
@@ -202,7 +202,7 @@ void ImageRegistration::LoadFromConfig(const ConfigManager::RegistrationConfig& 
     m_NumberOfSpatialSamples = config.numberOfSpatialSamples;
     m_LearningRate = config.learningRate;
     m_MinimumStepLength = config.minimumStepLength;
-    m_NumberOfIterations = config.numberOfIterations;
+    m_NumberOfIterations = config.numberOfIterations;  // 现在是vector
     m_RelaxationFactor = config.relaxationFactor;
     m_GradientMagnitudeTolerance = config.gradientMagnitudeTolerance;
     m_NumberOfLevels = config.numberOfLevels;
@@ -711,6 +711,20 @@ static void ComputeAffineJacobian(
 
 void ImageRegistration::RunSingleLevelRigid(ImageType::Pointer fixedImage, ImageType::Pointer movingImage, unsigned int level)
 {
+    // 获取当前层的迭代次数
+    unsigned int currentIterations = m_NumberOfIterations[0];  // 默认使用第一个值
+    if (level < m_NumberOfIterations.size())
+    {
+        currentIterations = m_NumberOfIterations[level];
+    }
+    
+    // 如果当前层迭代次数为0,直接跳过
+    if (currentIterations == 0)
+    {
+        std::cout << "  [Skipping] Level " << level << " iterations set to 0" << std::endl;
+        return;
+    }
+    
     // 配置度量
     m_Metric->SetFixedImage(fixedImage);
     m_Metric->SetMovingImage(movingImage);
@@ -731,7 +745,7 @@ void ImageRegistration::RunSingleLevelRigid(ImageType::Pointer fixedImage, Image
     m_Metric->SetNumberOfParameters(6);
     m_Metric->SetUseStratifiedSampling(m_UseStratifiedSampling);
     
-    // 设置雅可比函数（不需要链式法则，因为没有 composite）
+    // 设置雅可比函数(不需要链式法则，因为没有 composite)
     auto rigidTransformPtr = m_RigidTransform;
     m_Metric->SetJacobianFunction([rigidTransformPtr](const ImageType::PointType& point,
                                                        std::vector<std::array<double, 3>>& jacobian) {
@@ -740,10 +754,15 @@ void ImageRegistration::RunSingleLevelRigid(ImageType::Pointer fixedImage, Image
     
     m_Metric->Initialize();
 
-    // 配置优化器
-    m_Optimizer->SetLearningRate(m_LearningRate);
+    // 配置优化器 - 使用分层学习率
+    double currentLearningRate = (level < m_LearningRate.size()) 
+                                  ? m_LearningRate[level] 
+                                  : m_LearningRate.back();
+    std::cout << "  Learning Rate: " << std::fixed << std::setprecision(4) << currentLearningRate << std::endl;
+    
+    m_Optimizer->SetLearningRate(currentLearningRate);
     m_Optimizer->SetMinimumStepLength(m_MinimumStepLength);
-    m_Optimizer->SetNumberOfIterations(m_NumberOfIterations);
+    m_Optimizer->SetNumberOfIterations(currentIterations);  // 使用当前层的迭代次数
     m_Optimizer->SetRelaxationFactor(m_RelaxationFactor);
     m_Optimizer->SetGradientMagnitudeTolerance(m_GradientMagnitudeTolerance);
     m_Optimizer->SetReturnBestParametersAndValue(true);
@@ -825,6 +844,20 @@ void ImageRegistration::RunSingleLevelRigid(ImageType::Pointer fixedImage, Image
 
 void ImageRegistration::RunSingleLevelAffine(ImageType::Pointer fixedImage, ImageType::Pointer movingImage, unsigned int level)
 {
+    // 获取当前层的迭代次数
+    unsigned int currentIterations = m_NumberOfIterations[0];
+    if (level < m_NumberOfIterations.size())
+    {
+        currentIterations = m_NumberOfIterations[level];
+    }
+    
+    // 如果当前层迭代次数为0,直接跳过
+    if (currentIterations == 0)
+    {
+        std::cout << "  [Skipping] Level " << level << " iterations set to 0" << std::endl;
+        return;
+    }
+    
     // 配置度量
     m_Metric->SetFixedImage(fixedImage);
     m_Metric->SetMovingImage(movingImage);
@@ -854,10 +887,15 @@ void ImageRegistration::RunSingleLevelAffine(ImageType::Pointer fixedImage, Imag
     
     m_Metric->Initialize();
 
-    // 配置优化器
-    m_Optimizer->SetLearningRate(m_LearningRate);
+    // 配置优化器 - 使用分层学习率
+    double currentLearningRate = (level < m_LearningRate.size()) 
+                                  ? m_LearningRate[level] 
+                                  : m_LearningRate.back();
+    std::cout << "  Learning Rate: " << std::fixed << std::setprecision(4) << currentLearningRate << std::endl;
+    
+    m_Optimizer->SetLearningRate(currentLearningRate);
     m_Optimizer->SetMinimumStepLength(m_MinimumStepLength);
-    m_Optimizer->SetNumberOfIterations(m_NumberOfIterations);
+    m_Optimizer->SetNumberOfIterations(currentIterations);  // 使用当前层的迭代次数
     m_Optimizer->SetRelaxationFactor(m_RelaxationFactor);
     m_Optimizer->SetGradientMagnitudeTolerance(m_GradientMagnitudeTolerance);
     m_Optimizer->SetReturnBestParametersAndValue(true);

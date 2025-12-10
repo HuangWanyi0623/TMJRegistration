@@ -6,6 +6,9 @@
 #include <random>
 #include <array>
 #include <functional>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include "itkImage.h"
 #include "itkLinearInterpolateImageFunction.h"
 #include "itkTransform.h"
@@ -73,6 +76,10 @@ public:
     
     // 采样策略设置
     void SetUseStratifiedSampling(bool use) { m_UseStratifiedSampling = use; }
+    
+    // 多线程设置
+    void SetNumberOfThreads(unsigned int n) { m_NumberOfThreads = n; }
+    unsigned int GetNumberOfThreads() const { return m_NumberOfThreads; }
 
     // 初始化
     void Initialize();
@@ -152,6 +159,28 @@ private:
     // 随机数生成器
     std::mt19937 m_RandomGenerator;
     bool m_Verbose; // 调试输出
+    
+    // 多线程参数
+    unsigned int m_NumberOfThreads;
+    
+    // 多线程局部直方图 (每个线程一个)
+    struct ThreadLocalHistograms
+    {
+        std::vector<std::vector<double>> jointPDF;
+        std::vector<std::vector<std::vector<double>>> jointPDFDerivatives;
+        unsigned int validSamples;
+        
+        ThreadLocalHistograms(unsigned int numBins, unsigned int numParams)
+            : validSamples(0)
+        {
+            jointPDF.resize(numBins, std::vector<double>(numBins, 0.0));
+            jointPDFDerivatives.resize(numParams);
+            for (auto& paramDeriv : jointPDFDerivatives)
+            {
+                paramDeriv.resize(numBins, std::vector<double>(numBins, 0.0));
+            }
+        }
+    };
 
     // ============ 内部方法 ============
     
@@ -174,6 +203,8 @@ private:
     
     // 核心计算
     void ComputeJointPDFAndDerivatives();
+    void ComputeJointPDFAndDerivativesThreaded();  // 多线程版本
+    void ComputePDFRange(size_t startIdx, size_t endIdx, ThreadLocalHistograms& localHist);
     double ComputeMutualInformation();
     void ComputeAnalyticalGradient(ParametersType& derivative);
     

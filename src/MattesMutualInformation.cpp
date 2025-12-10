@@ -27,6 +27,7 @@ MattesMutualInformation::MattesMutualInformation()
     , m_FixedImageBinSize(1.0)
     , m_MovingImageBinSize(1.0)
     , m_CurrentValue(0.0)
+    , m_NumberOfThreads(std::thread::hardware_concurrency())  // 自动检测CPU核心数
 {
     m_Interpolator = InterpolatorType::New();
     m_RandomGenerator.seed(m_RandomSeed);
@@ -36,6 +37,10 @@ MattesMutualInformation::MattesMutualInformation()
     {
         m_GradientInterpolators[i] = InterpolatorType::New();
     }
+    
+    if (m_NumberOfThreads == 0) m_NumberOfThreads = 1;
+    
+    std::cout << "[Metric] Multi-threading enabled: " << m_NumberOfThreads << " threads" << std::endl;
 }
 
 MattesMutualInformation::~MattesMutualInformation()
@@ -679,6 +684,222 @@ void MattesMutualInformation::ComputeJointPDFAndDerivatives()
 }
 
 // ============================================================================
+// 多线程版本: 核心计算 - 联合PDF和导数 (高性能)
+// ============================================================================
+
+void MattesMutualInformation::ComputePDFRange(
+    size_t startIdx, 
+    size_t endIdx, 
+    ThreadLocalHistograms& localHist)
+{
+    std::vector<std::array<double, 3>> jacobian;
+    
+    // 处理分配给此线程的采样点
+    for (size_t sampleIdx = startIdx; sampleIdx < endIdx; ++sampleIdx)
+    {
+        const auto& sample = m_SamplePoints[sampleIdx];
+        
+        // 使用变换将固定图像点变换到移动图像空间
+        ImageType::PointType transformedPoint = m_Transform->TransformPoint(sample.fixedPoint);
+
+        // 检查变换后的点是否在移动图像范围内
+        if (!m_Interpolator->IsInsideBuffer(transformedPoint))
+        {
+            continue;
+        }
+
+        // 插值获取移动图像值
+        double movingValue = m_Interpolator->Evaluate(transformedPoint);
+        
+        // 计算移动图像的连续索引和B样条权重
+        double movingContinuousIndex = ComputeMovingImageContinuousIndex(movingValue);
+        int movingStartIndex;
+        std::array<double, 4> movingBSplineWeights;
+        ComputeBSplineWeights(movingContinuousIndex, movingStartIndex, movingBSplineWeights);
+        
+        // 计算移动图像B样条导数权重
+        std::array<double, 4> movingBSplineDerivativeWeights;
+        int tempStartIndex;
+        ComputeBSplineDerivativeWeights(movingContinuousIndex, tempStartIndex, movingBSplineDerivativeWeights);
+        
+        // 获取移动图像梯度
+        std::array<double, 3> movingGradient = {0.0, 0.0, 0.0};
+        for (int dim = 0; dim < 3; ++dim)
+        {
+            if (m_GradientInterpolators[dim]->IsInsideBuffer(transformedPoint))
+            {
+                movingGradient[dim] = m_GradientInterpolators[dim]->Evaluate(transformedPoint);
+            }
+        }
+        
+        // 使用外部提供的雅可比函数计算变换雅可比矩阵
+        m_JacobianFunction(sample.fixedPoint, jacobian);
+        
+        // 计算 dm/dp = gradient_M^T * dT/dp
+        std::vector<double> dmDp(m_NumberOfParameters, 0.0);
+        for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
+        {
+            dmDp[k] = 0.0;
+            for (int d = 0; d < 3; ++d)
+            {
+                dmDp[k] += movingGradient[d] * jacobian[k][d];
+            }
+            dmDp[k] /= m_MovingImageBinSize;
+        }
+        
+        // 累加到局部线程的联合PDF和导数PDF
+        for (int fi = 0; fi < 4; ++fi)
+        {
+            int fixedBin = sample.fixedParzenWindowIndex + fi;
+            if (fixedBin < 0 || fixedBin >= static_cast<int>(m_NumberOfHistogramBins))
+                continue;
+                
+            double fixedWeight = sample.fixedBSplineWeights[fi];
+            
+            for (int mi = 0; mi < 4; ++mi)
+            {
+                int movingBin = movingStartIndex + mi;
+                if (movingBin < 0 || movingBin >= static_cast<int>(m_NumberOfHistogramBins))
+                    continue;
+                
+                double movingWeight = movingBSplineWeights[mi];
+                double movingDerivWeight = movingBSplineDerivativeWeights[mi];
+                
+                // 联合PDF贡献
+                double jointContribution = fixedWeight * movingWeight;
+                localHist.jointPDF[fixedBin][movingBin] += jointContribution;
+                
+                // 导数PDF贡献
+                for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
+                {
+                    double derivContribution = fixedWeight * movingDerivWeight * dmDp[k];
+                    localHist.jointPDFDerivatives[k][fixedBin][movingBin] += derivContribution;
+                }
+            }
+        }
+        
+        localHist.validSamples++;
+    }
+}
+
+void MattesMutualInformation::ComputeJointPDFAndDerivativesThreaded()
+{
+    if (!m_Transform)
+    {
+        throw std::runtime_error("Transform not set in metric");
+    }
+    
+    if (!m_JacobianFunction)
+    {
+        throw std::runtime_error("Jacobian function not set in metric");
+    }
+
+    // 清空全局直方图
+    for (auto& row : m_JointPDF)
+    {
+        std::fill(row.begin(), row.end(), 0.0);
+    }
+    std::fill(m_FixedImageMarginalPDF.begin(), m_FixedImageMarginalPDF.end(), 0.0);
+    std::fill(m_MovingImageMarginalPDF.begin(), m_MovingImageMarginalPDF.end(), 0.0);
+    
+    for (auto& paramDerivative : m_JointPDFDerivatives)
+    {
+        for (auto& row : paramDerivative)
+        {
+            std::fill(row.begin(), row.end(), 0.0);
+        }
+    }
+
+    // 创建线程局部直方图
+    std::vector<ThreadLocalHistograms> threadHistograms;
+    threadHistograms.reserve(m_NumberOfThreads);
+    for (unsigned int t = 0; t < m_NumberOfThreads; ++t)
+    {
+        threadHistograms.emplace_back(m_NumberOfHistogramBins, m_NumberOfParameters);
+    }
+
+    // 将采样点分配给各个线程
+    size_t totalSamples = m_SamplePoints.size();
+    size_t samplesPerThread = totalSamples / m_NumberOfThreads;
+    
+    std::vector<std::thread> threads;
+    threads.reserve(m_NumberOfThreads);
+    
+    for (unsigned int t = 0; t < m_NumberOfThreads; ++t)
+    {
+        size_t startIdx = t * samplesPerThread;
+        size_t endIdx = (t == m_NumberOfThreads - 1) ? totalSamples : (t + 1) * samplesPerThread;
+        
+        threads.emplace_back([this, startIdx, endIdx, &threadHistograms, t]() {
+            this->ComputePDFRange(startIdx, endIdx, threadHistograms[t]);
+        });
+    }
+    
+    // 等待所有线程完成
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+    
+    // 合并所有线程的局部直方图到全局直方图 (Reduce阶段)
+    m_NumberOfValidSamples = 0;
+    for (const auto& localHist : threadHistograms)
+    {
+        m_NumberOfValidSamples += localHist.validSamples;
+        
+        for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
+        {
+            for (unsigned int j = 0; j < m_NumberOfHistogramBins; ++j)
+            {
+                m_JointPDF[i][j] += localHist.jointPDF[i][j];
+                
+                for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
+                {
+                    m_JointPDFDerivatives[k][i][j] += localHist.jointPDFDerivatives[k][i][j];
+                }
+            }
+        }
+    }
+
+    // 归一化为概率分布
+    if (m_NumberOfValidSamples > 0)
+    {
+        double normFactor = 1.0 / static_cast<double>(m_NumberOfValidSamples);
+        
+        for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
+        {
+            for (unsigned int j = 0; j < m_NumberOfHistogramBins; ++j)
+            {
+                m_JointPDF[i][j] *= normFactor;
+                m_FixedImageMarginalPDF[i] += m_JointPDF[i][j];
+                m_MovingImageMarginalPDF[j] += m_JointPDF[i][j];
+                
+                for (unsigned int k = 0; k < m_NumberOfParameters; ++k)
+                {
+                    m_JointPDFDerivatives[k][i][j] *= normFactor;
+                }
+            }
+        }
+    }
+
+    if (m_Verbose)
+    {
+        unsigned int nonZeroBins = 0;
+        for (unsigned int i = 0; i < m_NumberOfHistogramBins; ++i)
+        {
+            for (unsigned int j = 0; j < m_NumberOfHistogramBins; ++j)
+            {
+                if (m_JointPDF[i][j] > 0.0)
+                    ++nonZeroBins;
+            }
+        }
+        double fillRatio = static_cast<double>(nonZeroBins) / (m_NumberOfHistogramBins * m_NumberOfHistogramBins);
+        std::cout << "[Metric Debug - Multithreaded] JointPDF filled bins: " << nonZeroBins 
+                  << " (" << fillRatio << "), Valid samples: " << m_NumberOfValidSamples << std::endl;
+    }
+}
+
+// ============================================================================
 // 计算互信息值
 // ============================================================================
 
@@ -778,7 +999,7 @@ void MattesMutualInformation::ComputeAnalyticalGradient(ParametersType& derivati
 
 double MattesMutualInformation::GetValue()
 {
-    ComputeJointPDFAndDerivatives();
+    ComputeJointPDFAndDerivativesThreaded();
     double mi = ComputeMutualInformation();
     m_CurrentValue = -mi;  // 返回负值,因为我们要最小化
     return m_CurrentValue;
@@ -787,13 +1008,13 @@ double MattesMutualInformation::GetValue()
 void MattesMutualInformation::GetDerivative(ParametersType& derivative)
 {
     // 先计算PDF(如果还没计算的话)
-    ComputeJointPDFAndDerivatives();
+    ComputeJointPDFAndDerivativesThreaded();
     ComputeAnalyticalGradient(derivative);
 }
 
 void MattesMutualInformation::GetValueAndDerivative(double& value, ParametersType& derivative)
 {
-    ComputeJointPDFAndDerivatives();
+    ComputeJointPDFAndDerivativesThreaded();
     value = -ComputeMutualInformation();
     m_CurrentValue = value;
     ComputeAnalyticalGradient(derivative);

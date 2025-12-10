@@ -31,7 +31,7 @@ struct CommandLineArgs
     std::string outputFolder;
     std::string configFilePath;
     std::string initialTransformPath;
-    std::string transformType = "Rigid";  // 默认刚体
+    std::string transformType;  // 空字符串表示未指定，使用配置文件的值
     bool showHelp = false;
     bool generateConfig = false;
     double samplingPercentage = -1.0;

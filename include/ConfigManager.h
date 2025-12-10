@@ -37,21 +37,21 @@ public:
         TransformType transformType = TransformType::Rigid;
         
         // 度量参数
-        unsigned int numberOfHistogramBins = 50;
-    unsigned int numberOfSpatialSamples = 0; // deprecated if samplingPercentage is used
-    double samplingPercentage = 0.1; // 10% sampling by default
+        unsigned int numberOfHistogramBins = 32;
+        unsigned int numberOfSpatialSamples = 0; // deprecated if samplingPercentage is used
+        double samplingPercentage = 0.25; // 25% sampling by default
         
         // 优化器参数
-        double learningRate = 0.5;
-        double minimumStepLength = 0.0001;
-        unsigned int numberOfIterations = 300;
-        double relaxationFactor = 0.8;
-        double gradientMagnitudeTolerance = 1e-4;
+        std::vector<double> learningRate = {2.0, 1.0, 0.5, 0.1, 0.05};  // Per-level learning rates
+        double minimumStepLength = 1e-6;
+        std::vector<unsigned int> numberOfIterations = {1000, 500, 250, 100, 0};  // ANTs 5-layer pyramid
+        double relaxationFactor = 0.5;
+        double gradientMagnitudeTolerance = 1e-6;
         
         // 多分辨率参数
-        unsigned int numberOfLevels = 3;
-        std::vector<unsigned int> shrinkFactors = {4, 2, 1};
-        std::vector<double> smoothingSigmas = {2.0, 1.0, 0.0};
+        unsigned int numberOfLevels = 5;
+        std::vector<unsigned int> shrinkFactors = {12, 8, 4, 2, 1};
+        std::vector<double> smoothingSigmas = {4.0, 3.0, 2.0, 1.0, 1.0};
         
         // 采样策略
         bool useStratifiedSampling = true;

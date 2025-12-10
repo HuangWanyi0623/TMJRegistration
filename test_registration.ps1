@@ -4,8 +4,8 @@ param(
     [Parameter(Position=2)] [string]$output,
     [string]$config,
     [string]$initial,
-    [string]$transform = "Rigid",
-    [double]$samplingPercentage = 0.1,
+    [string]$transform,
+    [double]$samplingPercentage,
     [switch]$DryRun
 )
 
@@ -66,9 +66,11 @@ $argsList += $moving
 $argsList += $output
 if ($config) { $argsList += "--config"; $argsList += $config }
 if ($initial) { $argsList += "--initial"; $argsList += $initial }
-if ($transform) { $argsList += "--transform"; $argsList += $transform }
+# Only pass transform if explicitly provided by user
+if ($PSBoundParameters.ContainsKey('transform')) { $argsList += "--transform"; $argsList += $transform }
 if ($PSBoundParameters.ContainsKey('Verbose')) { $argsList += "--verbose" }
-if ($samplingPercentage) { $argsList += "--sampling-percentage"; $argsList += $samplingPercentage }
+# Only pass samplingPercentage if explicitly provided by user (to not override config file)
+if ($PSBoundParameters.ContainsKey('samplingPercentage')) { $argsList += "--sampling-percentage"; $argsList += $samplingPercentage }
 
 Write-Host "Invoking: $exe $($argsList -join ' ')`n" -ForegroundColor DarkCyan
 if (-not $DryRun) {
