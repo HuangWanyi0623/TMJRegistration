@@ -4,6 +4,7 @@ param(
     [Parameter(Position=2)] [string]$output,
     [string]$config,
     [string]$initial,
+    [string]$fixedMask,
     [string]$transform,
     [double]$samplingPercentage,
     [switch]$DryRun
@@ -32,6 +33,7 @@ if (-not $fixed -or -not $moving -or -not $output) {
     if (-not $output) { $output = Read-Host "Output folder path (for .h5 transform file)" }
     if (-not $config) { $config = Read-Host "Optional: config json path (press Enter to use default)" }
     if (-not $initial) { $initial = Read-Host "Optional: initial transform .h5 file (press Enter to skip)" }
+    if (-not $fixedMask) { $fixedMask = Read-Host "Optional: fixed mask .nrrd file (press Enter to skip)" }
     if (-not $transform) { $transform = Read-Host "Transform type (Rigid/Affine) [Rigid]"; if (-not $transform) { $transform = "Rigid" } }
 }
 
@@ -66,6 +68,8 @@ $argsList += $moving
 $argsList += $output
 if ($config) { $argsList += "--config"; $argsList += $config }
 if ($initial) { $argsList += "--initial"; $argsList += $initial }
+# Pass fixed mask for local registration (only ROI voxels used)
+if ($fixedMask) { $argsList += "--fixed-mask"; $argsList += $fixedMask }
 # Only pass transform if explicitly provided by user
 if ($PSBoundParameters.ContainsKey('transform')) { $argsList += "--transform"; $argsList += $transform }
 if ($PSBoundParameters.ContainsKey('Verbose')) { $argsList += "--verbose" }

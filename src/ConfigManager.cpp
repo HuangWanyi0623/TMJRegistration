@@ -27,6 +27,7 @@ std::string ConfigManager::TransformTypeToString(TransformType type)
     {
         case TransformType::Rigid: return "Rigid";
         case TransformType::Affine: return "Affine";
+        case TransformType::RigidThenAffine: return "RigidThenAffine";
         default: return "Rigid";
     }
 }
@@ -37,6 +38,8 @@ ConfigManager::TransformType ConfigManager::StringToTransformType(const std::str
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
     
     if (lower == "affine") return TransformType::Affine;
+    if (lower == "rigidthenaffine" || lower == "rigid+affine" || lower == "rigidaffine") 
+        return TransformType::RigidThenAffine;
     return TransformType::Rigid;  // 默认刚体
 }
 

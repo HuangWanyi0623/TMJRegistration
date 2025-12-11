@@ -12,6 +12,7 @@
 #include "itkImage.h"
 #include "itkLinearInterpolateImageFunction.h"
 #include "itkTransform.h"
+#include "itkImageMaskSpatialObject.h"
 
 /**
  * @brief Mattes互信息度量类 - 带解析梯度
@@ -35,6 +36,8 @@ class MattesMutualInformation
 {
 public:
     using ImageType = itk::Image<float, 3>;
+    using MaskImageType = itk::Image<unsigned char, 3>;
+    using MaskSpatialObjectType = itk::ImageMaskSpatialObject<3>;
     using InterpolatorType = itk::LinearInterpolateImageFunction<ImageType, double>;
     using TransformBaseType = itk::Transform<double, 3, 3>;
     using ParametersType = std::vector<double>;
@@ -74,6 +77,11 @@ public:
     double GetSamplingPercentage() const { return m_SamplingPercentage; }
     void SetRandomSeed(unsigned int seed) { m_RandomSeed = seed; m_UseFixedSeed = true; }
     
+    // 掩膜设置 (用于局部配准,只在掩膜区域内采样)
+    void SetFixedImageMask(MaskSpatialObjectType::Pointer mask) { m_FixedImageMask = mask; }
+    MaskSpatialObjectType::Pointer GetFixedImageMask() const { return m_FixedImageMask; }
+    bool HasFixedImageMask() const { return m_FixedImageMask.IsNotNull(); }
+    
     // 采样策略设置
     void SetUseStratifiedSampling(bool use) { m_UseStratifiedSampling = use; }
     
@@ -104,6 +112,9 @@ private:
     ImageType::Pointer m_MovingImage;
     InterpolatorType::Pointer m_Interpolator;
     TransformBaseType::Pointer m_Transform;
+    
+    // 掩膜 (可选,用于局部配准)
+    MaskSpatialObjectType::Pointer m_FixedImageMask;
     
     // 雅可比矩阵计算函数(外部提供)
     JacobianFunctionType m_JacobianFunction;

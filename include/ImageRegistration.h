@@ -11,6 +11,7 @@
 #include <itkCompositeTransform.h>
 #include <itkShrinkImageFilter.h>
 #include <itkSmoothingRecursiveGaussianImageFilter.h>
+#include <itkImageMaskSpatialObject.h>
 #include "MattesMutualInformation.h"
 #include "RegularStepGradientDescentOptimizer.h"
 #include "ConfigManager.h"
@@ -35,6 +36,8 @@ class ImageRegistration
 {
 public:
     using ImageType = itk::Image<float, 3>;
+    using MaskImageType = itk::Image<unsigned char, 3>;
+    using MaskSpatialObjectType = itk::ImageMaskSpatialObject<3>;
     using RigidTransformType = itk::Euler3DTransform<double>;
     using AffineTransformType = itk::AffineTransform<double, 3>;
     using CompositeTransformType = itk::CompositeTransform<double, 3>;
@@ -55,6 +58,12 @@ public:
     void SetMovingImagePath(const std::string& path);
     void SetFixedImage(ImageType::Pointer fixedImage);
     void SetMovingImage(ImageType::Pointer movingImage);
+    
+    // =========== 掩膜设置 (用于局部配准) ===========
+    // 从文件加载固定图像掩膜 (支持 .nrrd/.nii.gz 等格式)
+    // 掩膜区域值>0的区域将参与配准计算,值=0的区域被忽略
+    bool LoadFixedMask(const std::string& maskFilePath);
+    bool HasFixedMask() const { return m_FixedImageMask.IsNotNull(); }
 
     // =========== 变换类型设置 ===========
     void SetTransformType(ConfigManager::TransformType type);
@@ -95,6 +104,23 @@ public:
     void SetSamplingPercentage(double percent) { m_SamplingPercentage = percent; }
     void SetVerbose(bool v) { m_Verbose = v; }
     bool GetVerbose() const { return m_Verbose; }
+    
+    // =========== 参数获取 (用于级联配准) ===========
+    ImageType::Pointer GetFixedImage() const { return m_FixedImage; }
+    ImageType::Pointer GetMovingImage() const { return m_MovingImage; }
+    MaskSpatialObjectType::Pointer GetFixedImageMask() const { return m_FixedImageMask; }
+    unsigned int GetNumberOfHistogramBins() const { return m_NumberOfHistogramBins; }
+    double GetSamplingPercentage() const { return m_SamplingPercentage; }
+    std::vector<double> GetLearningRate() const { return m_LearningRate; }
+    double GetMinimumStepLength() const { return m_MinimumStepLength; }
+    std::vector<unsigned int> GetNumberOfIterations() const { return m_NumberOfIterations; }
+    double GetRelaxationFactor() const { return m_RelaxationFactor; }
+    double GetGradientMagnitudeTolerance() const { return m_GradientMagnitudeTolerance; }
+    unsigned int GetNumberOfLevels() const { return m_NumberOfLevels; }
+    std::vector<unsigned int> GetShrinkFactors() const { return m_ShrinkFactors; }
+    std::vector<double> GetSmoothingSigmas() const { return m_SmoothingSigmas; }
+    unsigned int GetRandomSeed() const { return m_RandomSeed; }
+    void SetFixedImageMask(MaskSpatialObjectType::Pointer mask) { m_FixedImageMask = mask; }
 
     // =========== 执行配准 ===========
     void Update();
@@ -126,6 +152,10 @@ private:
     // =========== 输入图像 ===========
     ImageType::Pointer m_FixedImage;
     ImageType::Pointer m_MovingImage;
+    
+    // =========== 掩膜 (用于局部配准) ===========
+    MaskSpatialObjectType::Pointer m_FixedImageMask;
+    unsigned long m_MaskVoxelCount;  // 掩膜内体素数 (用于正确显示采样信息)
 
     // =========== 变换 ===========
     ConfigManager::TransformType m_TransformType;

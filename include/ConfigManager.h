@@ -26,8 +26,9 @@ public:
     // 变换类型枚举
     enum class TransformType
     {
-        Rigid,      // 刚体变换 (6参数)
-        Affine      // 仿射变换 (12参数)
+        Rigid,           // 刚体变换 (6参数)
+        Affine,          // 仿射变换 (12参数)
+        RigidThenAffine  // 级联变换: 先刚体后仿射 (自动两阶段)
     };
     
     // 配置参数结构

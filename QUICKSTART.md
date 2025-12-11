@@ -65,18 +65,78 @@ cd e:\图像处理\TMJ_12.6
 
 ## 第四步: 运行配准
 
-### 方法1: 使用测试脚本
+### 方法1: 使用测试脚本 (推荐)
 
+#### 基础用法
 ```powershell
 .\test_registration.ps1
 # 按提示输入文件路径
 ```
 
+#### 高级用法 - 使用JSON配置
+
+**最佳实践: 级联配准 (推荐)** ⭐
+```powershell
+# 一次运行完成 Rigid + Affine 两阶段配准
+.\test_registration.ps1 fixed.nrrd moving.nrrd .\output\ `
+    -config config\Rigid+Affine.json `
+    -initial coarse_alignment.h5
+
+# 说明:
+# - 自动执行两阶段: Rigid (快速全局对齐) → Affine (精细调整)
+# - 最终输出合并的Affine变换
+# - 无需手动保存中间结果
+# - 最高精度,最佳稳定性
+```
+
+**单阶段配准**:
+```powershell
+# 使用Rigid刚体配准 (6自由度)
+.\test_registration.ps1 fixed.nrrd moving.nrrd .\output\ -config config\Rigid.json
+
+# 使用Affine仿射配准
+.\test_registration.ps1 fixed.nrrd moving.nrrd .\output\ -config config\Affine.json
+
+# 提供初始变换
+.\test_registration.ps1 fixed.nrrd moving.nrrd .\output\ `
+    -config config\Affine.json `
+    -initial .\output\rigid_result.h5
+```
+
+#### 局部配准 - 使用Mask掩膜 🎯
+```powershell
+# TMJ配准示例: 仅配准颞下颌关节区域
+.\test_registration.ps1 cbct_full.nrrd mri_tmj.nrrd .\output\ `
+    -config config\Rigid.json `
+    -initial coarse_alignment.h5 `
+    -fixedMask tmj_roi_mask.nrrd
+```
+
+**Mask使用场景**:
+- **TMJ配准**: CBCT全头 + MRI局部关节切片
+- **脊椎配准**: 忽略软组织,仅配准骨结构  
+- **肿瘤配准**: 仅关注病灶区域
+
+**Mask文件要求**:
+- 格式: .nrrd 或 .nii.gz
+- ROI区域: 值 > 0 (通常为1)
+- 背景区域: 值 = 0
+- 生成工具: 3D Slicer Segment Editor → Export LabelMapVolume
+
 ### 方法2: 直接运行
 
+#### 无Mask (全图配准)
 ```powershell
 .\build\bin\Release\MIRegistration.exe fixed_mri.nrrd moving_ct.nrrd .\output
 # 将在 .\output 文件夹中生成 transform_YYYYMMDD_HHMMSS.h5 文件
+```
+
+#### 有Mask (局部配准)
+```powershell
+.\build\bin\Release\MIRegistration.exe `
+    --fixed-mask roi_mask.nrrd `
+    --config config\Rigid.json `
+    fixed.nrrd moving.nrrd .\output\
 ```
 
 ## 第五步: 查看结果

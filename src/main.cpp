@@ -31,6 +31,7 @@ struct CommandLineArgs
     std::string outputFolder;
     std::string configFilePath;
     std::string initialTransformPath;
+    std::string fixedMaskPath;    // 掩膜路径 (用于局部配准)
     std::string transformType;  // 空字符串表示未指定，使用配置文件的值
     bool showHelp = false;
     bool generateConfig = false;
@@ -99,6 +100,7 @@ void PrintUsage(const char* programName)
     std::cout << "  --help, -h          Show this help message" << std::endl;
     std::cout << "  --config <file>     Load configuration from JSON file" << std::endl;
     std::cout << "  --initial <file>    Load initial transform from .h5 file (coarse registration)" << std::endl;
+    std::cout << "  --fixed-mask <file> Load mask for local registration (only ROI voxels used)" << std::endl;
     std::cout << "  --transform <type>  Transform type: Rigid (default) or Affine" << std::endl;
     std::cout << "  --generate-config   Generate default config files and exit\n" << std::endl;
     std::cout << "  --sampling-percentage <0.0-1.0>  Sampling ratio (default 0.10)\n";
@@ -107,6 +109,7 @@ void PrintUsage(const char* programName)
     std::cout << "  " << programName << " fixed.nrrd moving.nrrd output/" << std::endl;
     std::cout << "  " << programName << " --config Affine.json fixed.nrrd moving.nrrd output/" << std::endl;
     std::cout << "  " << programName << " --initial coarse.h5 fixed.nrrd moving.nrrd output/" << std::endl;
+    std::cout << "  " << programName << " --fixed-mask mask.nrrd --initial coarse.h5 fixed.nrrd moving.nrrd output/" << std::endl;
     std::cout << "  " << programName << " --transform Affine fixed.nrrd moving.nrrd output/\n" << std::endl;
     
     std::cout << "Supported image formats: NIFTI (.nii, .nii.gz), NRRD (.nrrd), MetaImage (.mhd/.mha)" << std::endl;
@@ -155,6 +158,18 @@ bool ParseCommandLine(int argc, std::vector<std::string>& args, CommandLineArgs&
             else
             {
                 std::cerr << "[Error] --initial requires a file path" << std::endl;
+                return false;
+            }
+        }
+        else if (arg == "--fixed-mask")
+        {
+            if (i + 1 < args.size())
+            {
+                parsedArgs.fixedMaskPath = args[++i];
+            }
+            else
+            {
+                std::cerr << "[Error] --fixed-mask requires a file path" << std::endl;
                 return false;
             }
         }
@@ -274,7 +289,14 @@ int main(int argc, char* argv[])
     {
         std::cout << "  Initial Transform: " << parsedArgs.initialTransformPath << std::endl;
     }
-    std::cout << "  Transform Type: " << parsedArgs.transformType << std::endl;
+    if (!parsedArgs.fixedMaskPath.empty())
+    {
+        std::cout << "  Fixed Mask: " << parsedArgs.fixedMaskPath << std::endl;
+    }
+    if (!parsedArgs.transformType.empty())
+    {
+        std::cout << "  Transform Type: " << parsedArgs.transformType << std::endl;
+    }
     std::cout << std::endl;
 
     // 验证输入文件
@@ -339,6 +361,23 @@ int main(int argc, char* argv[])
             }
         }
         
+        // 加载掩膜 (如果有,用于局部配准)
+        if (!parsedArgs.fixedMaskPath.empty())
+        {
+            if (fs::exists(parsedArgs.fixedMaskPath))
+            {
+                if (!registration.LoadFixedMask(parsedArgs.fixedMaskPath))
+                {
+                    std::cerr << "[Warning] Failed to load mask, continuing without mask" << std::endl;
+                }
+            }
+            else
+            {
+                std::cerr << "[Warning] Mask file not found: " 
+                          << parsedArgs.fixedMaskPath << std::endl;
+            }
+        }
+        
         // 设置观察者
         registration.SetIterationObserver([](int iteration, double value, double stepLength) {
             std::cout << "  Iteration " << std::setw(4) << iteration 
@@ -353,21 +392,203 @@ int main(int argc, char* argv[])
             std::cout << "  Smoothing Sigma: " << sigma << " mm" << std::endl;
         });
         
-        // 执行配准
-        std::cout << "\n[Starting Registration...]" << std::endl;
-        registration.Update();
+        // 判断是否为级联配准
+        bool isCascade = (configManager.GetConfig().transformType == ConfigManager::TransformType::RigidThenAffine);
+        double totalElapsedTime = 0.0;
         
-        // 获取结果
-        double elapsedTime = registration.GetElapsedTime();
-        
-        std::cout << "\n[Registration Completed]" << std::endl;
-        std::cout << "  Total Time: " << std::fixed << std::setprecision(2) 
-                  << elapsedTime << " seconds" << std::endl;
+        if (isCascade)
+        {
+            std::cout << "\n[Cascade Registration Mode: Rigid + Affine]" << std::endl;
+            std::cout << "==========================================" << std::endl;
+            
+            // ===== 阶段1: 刚体配准 =====
+            std::cout << "\n[Phase 1: Rigid Registration]" << std::endl;
+            std::cout << "==========================================" << std::endl;
+            
+            registration.SetTransformType(ConfigManager::TransformType::Rigid);
+            registration.Update();
+            totalElapsedTime += registration.GetElapsedTime();
+            
+            std::cout << "\n[Phase 1 Completed]" << std::endl;
+            std::cout << "  Time: " << std::fixed << std::setprecision(2) 
+                      << registration.GetElapsedTime() << " seconds" << std::endl;
+            
+            // 输出刚体变换参数
+            auto rigidTransform = registration.GetRigidTransform();
+            auto rigidParams = rigidTransform->GetParameters();
+            std::cout << "  Rigid Transform:" << std::endl;
+            std::cout << "    Rotation (rad): [" << std::fixed << std::setprecision(6)
+                      << rigidParams[0] << ", " << rigidParams[1] << ", " << rigidParams[2] << "]" << std::endl;
+            std::cout << "    Translation (mm): [" << std::fixed << std::setprecision(4)
+                      << rigidParams[3] << ", " << rigidParams[4] << ", " << rigidParams[5] << "]" << std::endl;
+            
+            // ===== 阶段2: 仿射配准 (基于刚体结果) =====
+            std::cout << "\n[Phase 2: Affine Registration (initialized from Rigid)]" << std::endl;
+            std::cout << "==========================================" << std::endl;
+            
+            // 保存刚体结果到临时文件
+            fs::path tempRigidPath = fs::path(parsedArgs.outputFolder) / "temp_rigid_cascade.h5";
+            try
+            {
+                if (!fs::exists(parsedArgs.outputFolder))
+                {
+                    fs::create_directories(parsedArgs.outputFolder);
+                }
+                
+                using WriterType = itk::TransformFileWriter;
+                auto tempWriter = WriterType::New();
+                tempWriter->SetFileName(tempRigidPath.string());
+                tempWriter->SetInput(rigidTransform);
+                tempWriter->Update();
+                
+                std::cout << "[Temp] Rigid result saved: " << tempRigidPath.string() << std::endl;
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "[Warning] Could not save temp rigid transform: " << e.what() << std::endl;
+            }
+            
+            // 创建新的配准实例用于Affine阶段
+            ImageRegistration affineRegistration;
+            affineRegistration.SetFixedImage(registration.GetFixedImage());
+            affineRegistration.SetMovingImage(registration.GetMovingImage());
+            affineRegistration.SetTransformType(ConfigManager::TransformType::Affine);
+            
+            // 加载刚体结果作为初始变换
+            if (fs::exists(tempRigidPath))
+            {
+                affineRegistration.LoadInitialTransform(tempRigidPath.string());
+            }
+            
+            // 复制配置参数
+            affineRegistration.SetNumberOfHistogramBins(registration.GetNumberOfHistogramBins());
+            affineRegistration.SetSamplingPercentage(registration.GetSamplingPercentage());
+            affineRegistration.SetLearningRate(registration.GetLearningRate());
+            affineRegistration.SetMinimumStepLength(registration.GetMinimumStepLength());
+            affineRegistration.SetNumberOfIterations(registration.GetNumberOfIterations());
+            affineRegistration.SetRelaxationFactor(registration.GetRelaxationFactor());
+            affineRegistration.SetGradientMagnitudeTolerance(registration.GetGradientMagnitudeTolerance());
+            affineRegistration.SetNumberOfLevels(registration.GetNumberOfLevels());
+            affineRegistration.SetShrinkFactors(registration.GetShrinkFactors());
+            affineRegistration.SetSmoothingSigmas(registration.GetSmoothingSigmas());
+            affineRegistration.SetRandomSeed(registration.GetRandomSeed());
+            affineRegistration.SetUseStratifiedSampling(true);
+            
+            // 复制掩膜设置
+            if (registration.HasFixedMask())
+            {
+                affineRegistration.SetFixedImageMask(registration.GetFixedImageMask());
+            }
+            
+            // 设置观察者
+            affineRegistration.SetIterationObserver([](int iteration, double value, double stepLength) {
+                std::cout << "  Iteration " << std::setw(4) << iteration 
+                          << " | MI Value: " << std::fixed << std::setprecision(6) << value
+                          << " | Step: " << std::scientific << std::setprecision(2) << stepLength
+                          << std::endl;
+            });
+            
+            affineRegistration.SetLevelObserver([](int level, int shrinkFactor, double sigma) {
+                std::cout << "\n[Multi-Resolution Level " << (level + 1) << "]" << std::endl;
+                std::cout << "  Shrink Factor: " << shrinkFactor << "x" << std::endl;
+                std::cout << "  Smoothing Sigma: " << sigma << " mm" << std::endl;
+            });
+            
+            // 执行仿射配准
+            affineRegistration.Update();
+            totalElapsedTime += affineRegistration.GetElapsedTime();
+            
+            std::cout << "\n[Phase 2 Completed]" << std::endl;
+            std::cout << "  Time: " << std::fixed << std::setprecision(2) 
+                      << affineRegistration.GetElapsedTime() << " seconds" << std::endl;
+            
+            // 清理临时文件
+            try
+            {
+                if (fs::exists(tempRigidPath))
+                {
+                    fs::remove(tempRigidPath);
+                }
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "[Warning] Could not delete temp file: " << e.what() << std::endl;
+            }
+            
+            // 保存仿射结果的指针供后续使用
+            auto finalAffineTransform = affineRegistration.GetAffineTransform();
+            
+            std::cout << "\n[Cascade Registration Completed]" << std::endl;
+            std::cout << "  Total Time: " << std::fixed << std::setprecision(2) 
+                      << totalElapsedTime << " seconds" << std::endl;
+            
+            // 输出最终仿射变换参数
+            std::cout << "\n[Final Transform Parameters]" << std::endl;
+            auto parameters = finalAffineTransform->GetParameters();
+            std::cout << "  Matrix:" << std::endl;
+            std::cout << "    [" << std::fixed << std::setprecision(6)
+                      << parameters[0] << ", " << parameters[1] << ", " << parameters[2] << "]" << std::endl;
+            std::cout << "    [" << parameters[3] << ", " << parameters[4] << ", " << parameters[5] << "]" << std::endl;
+            std::cout << "    [" << parameters[6] << ", " << parameters[7] << ", " << parameters[8] << "]" << std::endl;
+            std::cout << "  Translation (mm):  [" 
+                      << std::fixed << std::setprecision(4)
+                      << parameters[9] << ", " 
+                      << parameters[10] << ", " 
+                      << parameters[11] << "]" << std::endl;
+            
+            auto center = finalAffineTransform->GetCenter();
+            std::cout << "  Center:   [" 
+                      << std::fixed << std::setprecision(2)
+                      << center[0] << ", " 
+                      << center[1] << ", " 
+                      << center[2] << "]" << std::endl;
+            
+            // 保存最终变换
+            std::cout << "\n[Saving Transform...]" << std::endl;
+            try
+            {
+                fs::path outputPath = fs::path(parsedArgs.outputFolder) / GenerateTimestampFilename();
+                
+                using WriterType = itk::TransformFileWriter;
+                auto writer = WriterType::New();
+                writer->SetFileName(outputPath.string());
+                writer->SetInput(finalAffineTransform);
+                writer->Update();
+                
+                std::cout << "[Transform Saved] " << outputPath.string() << std::endl;
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "[Error] Failed to save transform: " << e.what() << std::endl;
+                return EXIT_FAILURE;
+            }
+            
+            std::cout << "\n=== Registration Successfully Completed ===" << std::endl;
+            return EXIT_SUCCESS;
+        }
+        else
+        {
+            // 单阶段配准 (Rigid 或 Affine)
+            std::cout << "\n[Starting Registration...]" << std::endl;
+            registration.Update();
+            totalElapsedTime = registration.GetElapsedTime();
+            
+            std::cout << "\n[Registration Completed]" << std::endl;
+            std::cout << "  Total Time: " << std::fixed << std::setprecision(2) 
+                      << totalElapsedTime << " seconds" << std::endl;
+        }
         
         // 输出变换参数
         std::cout << "\n[Final Transform Parameters]" << std::endl;
         
-        if (configManager.GetConfig().transformType == ConfigManager::TransformType::Rigid)
+        // 级联配准总是输出Affine结果，单阶段按实际类型输出
+        ConfigManager::TransformType outputType = configManager.GetConfig().transformType;
+        if (outputType == ConfigManager::TransformType::RigidThenAffine)
+        {
+            outputType = ConfigManager::TransformType::Affine;  // 级联配准最终是Affine
+        }
+        
+        if (outputType == ConfigManager::TransformType::Rigid)
         {
             auto rigidTransform = registration.GetRigidTransform();
             auto parameters = rigidTransform->GetParameters();
@@ -420,7 +641,9 @@ int main(int argc, char* argv[])
         // 关键修复：直接保存单个最终变换，不使用 CompositeTransform
         // 这避免了 .h5 文件中包含多个变换导致的混淆
         itk::Transform<double, 3, 3>::Pointer finalTransform;
-        if (parsedArgs.transformType == "Rigid")
+        
+        // 级联配准保存Affine，单阶段按实际类型保存
+        if (outputType == ConfigManager::TransformType::Rigid)
         {
             finalTransform = registration.GetRigidTransform();
         }

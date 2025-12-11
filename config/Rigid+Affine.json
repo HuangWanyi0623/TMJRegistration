@@ -1,0 +1,33 @@
+{
+    "_comment": "Cascade Registration Configuration - Rigid + Affine (Automatic Two-Stage)",
+    "_description": "Performs Rigid registration first, then uses the result to initialize Affine registration for optimal accuracy",
+    
+    "transformType": "RigidThenAffine",
+    
+    "_section_metric": "=== Metric Parameters ===",
+    "numberOfHistogramBins": 32,
+    "samplingPercentage": 0.1,
+    
+    "_section_optimizer": "=== Optimizer Parameters ===",
+    "_note_learningRate": "Per-level learning rates for both stages: coarse levels use larger steps (1.0), fine levels use smaller steps",
+    "learningRate": [1.0, 1.0, 1.0, 1.0, 1.0],
+    "minimumStepLength": 1e-6,
+    "numberOfIterations": [1000, 500, 250, 100, 0],
+    "relaxationFactor": 0.5,
+    "gradientMagnitudeTolerance": 1e-6,
+    
+    "_section_multiresolution": "=== Multi-Resolution Parameters ===",
+    "_note": "5-layer pyramid strategy used for BOTH Rigid and Affine stages",
+    "numberOfLevels": 5,
+    "shrinkFactors": [12, 8, 4, 2, 1],
+    "smoothingSigmas": [4.0, 3.0, 2.0, 1.0, 1.0],
+    
+    "_section_sampling": "=== Sampling Parameters ===",
+    "useStratifiedSampling": true,
+    "randomSeed": 121212,
+    
+    "_usage": "=== Usage ===",
+    "_example": ".\test_registration.ps1 fixed.nrrd moving.nrrd output\\ -config config\\Rigid+Affine.json -initial coarse.h5",
+    "_workflow": "Stage 1: Rigid (6 DOF) -> Stage 2: Affine (12 DOF, initialized from Rigid result)",
+    "_output": "Final transform is Affine, incorporating both stages automatically"
+}

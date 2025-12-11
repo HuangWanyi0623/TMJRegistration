@@ -92,6 +92,8 @@ for each parameter p[i]:
 
 ### 1.3 采样策略
 
+#### 1.3.1 基础随机采样
+
 **当前实现**: 固定图像随机均匀采样
 
 ```cpp
@@ -110,9 +112,64 @@ samples = all_voxels[0:N]
 - 减少计算量
 - 避免偏差
 
+#### 1.3.2 掩膜感知采样 (Mask-Aware Sampling)
+
+**用途**: 局部配准 - 仅关注感兴趣区域(ROI)
+
+**实现逻辑**:
+```cpp
+// 如果提供了掩膜
+if (mask != null):
+    // 1. 统计掩膜内体素数
+    mask_voxels = CountVoxelsInMask(fixed_image, mask)
+    
+    // 2. 计算目标采样数 (百分比基于掩膜区域)
+    num_samples = mask_voxels * sampling_percentage
+    
+    // 3. 采样时过滤掉掩膜外的点
+    for each candidate_point:
+        physical_point = IndexToPhysical(candidate_point)
+        if mask.IsInside(physical_point):
+            samples.add(candidate_point)
+```
+
+**关键修复 (2025-12-10/11)**:
+
+**Bug #1: 采样数计算错误**
+- **问题**: 采样数基于全图像计算,导致掩膜内过度采样
+  - 示例: 全图1.5亿体素,掩膜覆盖15.8% (2400万),配置采样10%
+  - 错误逻辑: 1.5亿 × 10% = 1534万样本
+  - 实际效果: 1534万 / 2400万 = **63.3%过度采样**!
+  
+- **修复**: 采样数现在基于掩膜区域计算 (`MattesMutualInformation.cpp` 第89-122行)
+  - 正确逻辑: 2400万 × 10% = 240万样本
+  - 采样率: 240万 / 2400万 = **10%合理采样**
+  
+**Bug #2: 显示信息错误**
+- **问题**: 输出仍显示 `Using 15341231 samples (10.0% of total voxels)` (基于全图)
+- **修复**: 现在正确显示 `Using 2423974 samples (10.0% of mask region, 24239738 voxels in mask)`
+  - 修复位置: `ImageRegistration.cpp` 第1089-1130行
+  - 优化: 复用 `LoadFixedMask()` 统计的体素数,避免重复遍历图像
+
+**实现要点**:
+1. `LoadFixedMask()`: 加载时统计并保存 `m_MaskVoxelCount`
+2. `MattesMutualInformation::Initialize()`: 使用Mask体素数计算采样数
+3. `ImageRegistration::Update()`: 打印采样信息时使用保存的Mask体素数
+
+**医学应用场景**:
+- TMJ (颞下颌关节) 局部配准: CBCT全头 + MRI局部切片
+- 脊椎局部配准: 忽略周围软组织
+- 肿瘤局部配准: 仅关注病灶区域
+
+**性能影响**:
+- 计算量降低: 仅处理ROI内采样点
+- 精度提升: 避免无关区域干扰
+- 收敛速度: 取决于ROI复杂度
+
 **可选策略**:
 - 重要性采样(高梯度区域)
 - 分层采样(保证各区域都有采样)
+- 多掩膜加权采样
 
 ---
 

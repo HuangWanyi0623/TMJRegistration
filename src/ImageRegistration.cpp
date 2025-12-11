@@ -30,6 +30,7 @@ ImageRegistration::ImageRegistration()
     , m_FinalMetricValue(0.0)
     , m_ElapsedTime(0.0)
     , m_Verbose(false)
+    , m_MaskVoxelCount(0)  // 初始化掩膜体素数为0
 {
     // 默认多分辨率设置
     m_ShrinkFactors = {4, 2, 1};
@@ -96,6 +97,60 @@ void ImageRegistration::SetFixedImage(ImageType::Pointer fixedImage)
 void ImageRegistration::SetMovingImage(ImageType::Pointer movingImage)
 {
     m_MovingImage = movingImage;
+}
+
+// ============================================================================
+// 掩膜加载 (用于局部配准)
+// ============================================================================
+
+bool ImageRegistration::LoadFixedMask(const std::string& maskFilePath)
+{
+    try
+    {
+        // 读取掩膜图像 (通常是 unsigned char 类型的 LabelMap)
+        using MaskReaderType = itk::ImageFileReader<MaskImageType>;
+        auto maskReader = MaskReaderType::New();
+        maskReader->SetFileName(maskFilePath);
+        maskReader->Update();
+        
+        MaskImageType::Pointer maskImage = maskReader->GetOutput();
+        
+        // 将图像包装为 ImageMaskSpatialObject
+        m_FixedImageMask = MaskSpatialObjectType::New();
+        m_FixedImageMask->SetImage(maskImage);
+        m_FixedImageMask->Update();
+        
+        // 统计掩膜内的体素数量
+        using IteratorType = itk::ImageRegionConstIterator<MaskImageType>;
+        IteratorType it(maskImage, maskImage->GetLargestPossibleRegion());
+        unsigned long maskVoxels = 0;
+        unsigned long totalVoxels = 0;
+        for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+        {
+            ++totalVoxels;
+            if (it.Get() > 0)
+            {
+                ++maskVoxels;
+            }
+        }
+        
+        double maskPercentage = 100.0 * static_cast<double>(maskVoxels) / static_cast<double>(totalVoxels);
+        
+        // 保存掩膜体素数供后续使用
+        m_MaskVoxelCount = maskVoxels;
+        
+        std::cout << "[Fixed Mask] Loaded: " << maskFilePath << std::endl;
+        std::cout << "  Mask coverage: " << maskVoxels << " / " << totalVoxels 
+                  << " voxels (" << std::fixed << std::setprecision(1) << maskPercentage << "%)" << std::endl;
+        
+        return true;
+    }
+    catch (const itk::ExceptionObject& e)
+    {
+        std::cerr << "[Error] Failed to load mask: " << e.what() << std::endl;
+        m_FixedImageMask = nullptr;
+        return false;
+    }
 }
 
 // ============================================================================
@@ -739,6 +794,12 @@ void ImageRegistration::RunSingleLevelRigid(ImageType::Pointer fixedImage, Image
     }
     m_Metric->SetRandomSeed(m_RandomSeed);
     
+    // 设置掩膜 (如果有的话,用于局部配准)
+    if (m_FixedImageMask.IsNotNull())
+    {
+        m_Metric->SetFixedImageMask(m_FixedImageMask);
+    }
+    
     // 关键修复：直接使用已经从初始变换初始化好参数的 m_RigidTransform
     // 不再使用 CompositeTransform！这是 ANTs 的做法
     m_Metric->SetTransform(m_RigidTransform);
@@ -871,6 +932,12 @@ void ImageRegistration::RunSingleLevelAffine(ImageType::Pointer fixedImage, Imag
         m_Metric->SetNumberOfSpatialSamples(m_NumberOfSpatialSamples);
     }
     m_Metric->SetRandomSeed(m_RandomSeed);
+    
+    // 设置掩膜 (如果有的话,用于局部配准)
+    if (m_FixedImageMask.IsNotNull())
+    {
+        m_Metric->SetFixedImageMask(m_FixedImageMask);
+    }
     
     // 关键:直接使用已初始化的m_AffineTransform,不使用CompositeTransform
     // 与刚体配准采用相同的策略
@@ -1021,28 +1088,46 @@ void ImageRegistration::Update()
         std::cout << std::endl;
     }
 
-    // 计算采样信息
+    // 计算采样信息 (考虑掩膜)
     auto fixedRegion = m_FixedImage->GetLargestPossibleRegion();
     auto fixedSize = fixedRegion.GetSize();
     unsigned long totalVoxels = fixedSize[0] * fixedSize[1] * fixedSize[2];
+    unsigned long effectiveVoxels = totalVoxels;  // 有效体素数(考虑掩膜)
+    
+    // 如果有掩膜,使用之前统计好的掩膜体素数
+    if (m_FixedImageMask.IsNotNull() && m_MaskVoxelCount > 0)
+    {
+        effectiveVoxels = m_MaskVoxelCount;
+    }
+    
     unsigned int effectiveSamples = m_NumberOfSpatialSamples;
     double samplingPctDisplay = m_SamplingPercentage * 100.0;
     if (m_SamplingPercentage > 0.0 && m_SamplingPercentage <= 1.0)
     {
-        unsigned long computed = static_cast<unsigned long>(std::round(m_SamplingPercentage * static_cast<double>(totalVoxels)));
+        unsigned long computed = static_cast<unsigned long>(std::round(m_SamplingPercentage * static_cast<double>(effectiveVoxels)));
         if (computed < 1) computed = 1;
-        if (computed > totalVoxels) computed = totalVoxels;
+        if (computed > effectiveVoxels) computed = effectiveVoxels;
         effectiveSamples = static_cast<unsigned int>(computed);
         samplingPctDisplay = m_SamplingPercentage * 100.0;
     }
     else
     {
         // compute percent from explicit samples
-        samplingPctDisplay = static_cast<double>(effectiveSamples) / static_cast<double>(totalVoxels) * 100.0;
+        samplingPctDisplay = static_cast<double>(effectiveSamples) / static_cast<double>(effectiveVoxels) * 100.0;
     }
-    std::cout << "Using " << effectiveSamples << " samples (" 
-              << std::fixed << std::setprecision(1) << samplingPctDisplay 
-              << "% of total voxels)\n";
+    
+    if (m_FixedImageMask.IsNotNull())
+    {
+        std::cout << "Using " << effectiveSamples << " samples (" 
+                  << std::fixed << std::setprecision(1) << samplingPctDisplay 
+                  << "% of mask region, " << effectiveVoxels << " voxels in mask)\n";
+    }
+    else
+    {
+        std::cout << "Using " << effectiveSamples << " samples (" 
+                  << std::fixed << std::setprecision(1) << samplingPctDisplay 
+                  << "% of total voxels)\n";
+    }
 
     // 多分辨率金字塔
     for (unsigned int level = 0; level < m_NumberOfLevels; ++level)

@@ -86,13 +86,42 @@ void MattesMutualInformation::Initialize()
     m_FixedImageBinSize = (m_FixedImageMax - m_FixedImageMin) / m_NumberOfHistogramBins;
     m_MovingImageBinSize = (m_MovingImageMax - m_MovingImageMin) / m_NumberOfHistogramBins;
 
-    // 基于百分比计算采样数量
+    // 基于百分比计算采样数量 (考虑掩膜区域)
     if (m_SamplingPercentage > 0.0 && m_NumberOfSpatialSamples == 0)
     {
         auto region = m_FixedImage->GetLargestPossibleRegion();
         auto size = region.GetSize();
         unsigned long totalVoxels = static_cast<unsigned long>(size[0]) * size[1] * size[2];
-        m_NumberOfSpatialSamples = static_cast<unsigned int>(totalVoxels * m_SamplingPercentage + 0.5);
+        
+        // 如果有掩膜,需要先计算掩膜内的体素数
+        if (m_FixedImageMask.IsNotNull())
+        {
+            unsigned long maskVoxels = 0;
+            using IteratorType = itk::ImageRegionConstIteratorWithIndex<ImageType>;
+            IteratorType it(m_FixedImage, region);
+            for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+            {
+                ImageType::PointType physicalPoint;
+                m_FixedImage->TransformIndexToPhysicalPoint(it.GetIndex(), physicalPoint);
+                if (m_FixedImageMask->IsInsideInWorldSpace(physicalPoint))
+                {
+                    ++maskVoxels;
+                }
+            }
+            // 使用掩膜内体素数计算采样数
+            m_NumberOfSpatialSamples = static_cast<unsigned int>(maskVoxels * m_SamplingPercentage + 0.5);
+            if (m_Verbose)
+            {
+                std::cout << "[Metric] Mask-aware sampling: " << maskVoxels << " voxels in mask, "
+                          << m_NumberOfSpatialSamples << " samples (" 
+                          << (m_SamplingPercentage * 100.0) << "% of mask)" << std::endl;
+            }
+        }
+        else
+        {
+            // 没有掩膜时使用全图像体素数
+            m_NumberOfSpatialSamples = static_cast<unsigned int>(totalVoxels * m_SamplingPercentage + 0.5);
+        }
     }
 
     if (m_Verbose)
@@ -248,6 +277,16 @@ void MattesMutualInformation::SampleFixedImage()
 
     for (it.GoToBegin(); !it.IsAtEnd(); ++it)
     {
+        // 如果设置了掩膜,只收集掩膜内部的索引
+        if (m_FixedImageMask.IsNotNull())
+        {
+            ImageType::PointType physicalPoint;
+            m_FixedImage->TransformIndexToPhysicalPoint(it.GetIndex(), physicalPoint);
+            if (!m_FixedImageMask->IsInsideInWorldSpace(physicalPoint))
+            {
+                continue;  // 跳过掩膜外的点
+            }
+        }
         allIndices.push_back(it.GetIndex());
     }
 
@@ -278,7 +317,8 @@ void MattesMutualInformation::SampleFixedImage()
     if (m_Verbose)
     {
         std::cout << "[Metric Debug] SampleFixedImage: numSamples=" << numSamples
-                  << " validSamples=" << m_NumberOfValidSamples << std::endl;
+                  << " validSamples=" << m_NumberOfValidSamples 
+                  << " maskEnabled=" << (m_FixedImageMask.IsNotNull() ? "Yes" : "No") << std::endl;
     }
 }
 
@@ -352,8 +392,21 @@ void MattesMutualInformation::SampleFixedImageStratified()
                     index[1] = std::min(index[1], static_cast<ImageType::IndexType::IndexValueType>(size[1] - 1));
                     index[2] = std::min(index[2], static_cast<ImageType::IndexType::IndexValueType>(size[2] - 1));
                     
+                    // 转换为物理坐标
+                    ImageType::PointType physicalPoint;
+                    m_FixedImage->TransformIndexToPhysicalPoint(index, physicalPoint);
+                    
+                    // 掩膜检查: 如果设置了掩膜,只采样掩膜内部的点
+                    if (m_FixedImageMask.IsNotNull())
+                    {
+                        if (!m_FixedImageMask->IsInsideInWorldSpace(physicalPoint))
+                        {
+                            continue;  // 跳过掩膜外的点
+                        }
+                    }
+                    
                     SamplePoint sample;
-                    m_FixedImage->TransformIndexToPhysicalPoint(index, sample.fixedPoint);
+                    sample.fixedPoint = physicalPoint;
                     sample.fixedValue = m_FixedImage->GetPixel(index);
                     
                     // 预计算固定图像B样条权重
@@ -380,6 +433,16 @@ void MattesMutualInformation::SampleFixedImageRandom()
     
     for (it.GoToBegin(); !it.IsAtEnd(); ++it)
     {
+        // 如果设置了掩膜,只收集掩膜内部的索引
+        if (m_FixedImageMask.IsNotNull())
+        {
+            ImageType::PointType physicalPoint;
+            m_FixedImage->TransformIndexToPhysicalPoint(it.GetIndex(), physicalPoint);
+            if (!m_FixedImageMask->IsInsideInWorldSpace(physicalPoint))
+            {
+                continue;  // 跳过掩膜外的点
+            }
+        }
         allIndices.push_back(it.GetIndex());
     }
 
